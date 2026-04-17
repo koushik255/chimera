@@ -6,10 +6,10 @@ from websockets.asyncio.client import connect
 
 from scanner import scan_series
 
-WS_URL = "ws://localhost:8000/ws/host"
-SERIES_PATH = Path("/home/koushikk/MANGA/Usogui")
-HOST_ID = "host-local-usogui"
-HOST_USERNAME = "local-usogui"
+WS_URL = "ws://100.114.14.97:8000/ws/host"
+SERIES_PATH = Path("D:/MANGA/Usogui")
+HOST_ID = "windows-koushik-host"
+HOST_USERNAME = "WINDOWS-KOUSHIK"
 
 
 def build_manifest_payload() -> tuple[dict, dict[str, Path]]:
