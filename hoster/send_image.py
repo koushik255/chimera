@@ -7,43 +7,54 @@ from websockets.asyncio.client import connect
 from scanner import scan_series
 
 WS_URL = "ws://100.114.14.97:8000/ws/host"
-SERIES_PATH = Path("D:/MANGA/Usogui")
+SERIES_PATHS = [
+    Path("D:/MANGA/Usogui"),
+]
 HOST_ID = "windows-koushik-host"
 HOST_USERNAME = "WINDOWS-KOUSHIK"
 
 
-def build_manifest_payload() -> tuple[dict, dict[str, Path]]:
-    series = scan_series(SERIES_PATH)
+def build_manifest_payload() -> tuple[dict, dict[str, Path], dict[str, dict]]:
+    manifest_series_entries: list[dict] = []
     page_lookup: dict[str, Path] = {}
+    page_metadata: dict[str, dict] = {}
 
-    manifest_series = {
-        "id": series.id,
-        "title": series.title,
-        "volumes": [],
-    }
-
-    for volume in series.volumes:
-        manifest_volume = {
-            "id": volume.id,
-            "seriesId": volume.series_id,
-            "title": volume.title,
-            "volumeNumber": volume.volume_number,
-            "pageCount": len(volume.pages),
-            "pages": [],
+    for series_path in SERIES_PATHS:
+        series = scan_series(series_path)
+        manifest_series = {
+            "id": series.id,
+            "title": series.title,
+            "volumes": [],
         }
 
-        for page in volume.pages:
-            page_lookup[page.id] = page.file_path
-            manifest_volume["pages"].append({
-                "id": page.id,
-                "volumeId": page.volume_id,
-                "index": page.index,
-                "fileName": page.file_name,
-                "contentType": page.content_type,
-                "fileSize": page.file_size,
-            })
+        for volume in series.volumes:
+            manifest_volume = {
+                "id": volume.id,
+                "seriesId": volume.series_id,
+                "title": volume.title,
+                "volumeNumber": volume.volume_number,
+                "pageCount": len(volume.pages),
+                "pages": [],
+            }
 
-        manifest_series["volumes"].append(manifest_volume)
+            for page in volume.pages:
+                if page.id in page_lookup:
+                    raise ValueError(f"Duplicate page id found while building manifest: {page.id}")
+
+                page_lookup[page.id] = page.file_path
+                page_metadata[page.id] = {
+                    "id": page.id,
+                    "volumeId": page.volume_id,
+                    "index": page.index,
+                    "fileName": page.file_name,
+                    "contentType": page.content_type,
+                    "fileSize": page.file_size,
+                }
+                manifest_volume["pages"].append(page_metadata[page.id])
+
+            manifest_series["volumes"].append(manifest_volume)
+
+        manifest_series_entries.append(manifest_series)
 
     payload = {
         "type": "register_manifest",
@@ -51,14 +62,19 @@ def build_manifest_payload() -> tuple[dict, dict[str, Path]]:
             "id": HOST_ID,
             "username": HOST_USERNAME,
         },
-        "series": [manifest_series],
+        "series": manifest_series_entries,
     }
 
-    return payload, page_lookup
+    return payload, page_lookup, page_metadata
 
 
 async def host_forever() -> None:
-    manifest_payload, page_lookup = build_manifest_payload()
+    manifest_payload, page_lookup, page_metadata = build_manifest_payload()
+    total_series = len(manifest_payload["series"])
+    total_volumes = sum(len(series["volumes"]) for series in manifest_payload["series"])
+    total_pages = len(page_lookup)
+
+    print(f"Prepared manifest with {total_series} series, {total_volumes} volumes, {total_pages} pages")
 
     async with connect(WS_URL, max_size=None) as websocket:
         greeting = await websocket.recv()
@@ -100,17 +116,7 @@ async def host_forever() -> None:
                 }))
                 continue
 
-            page_record = None
-            for series in manifest_payload["series"]:
-                for volume in series["volumes"]:
-                    for page in volume["pages"]:
-                        if page["id"] == page_id:
-                            page_record = page
-                            break
-                    if page_record is not None:
-                        break
-                if page_record is not None:
-                    break
+            page_record = page_metadata.get(page_id)
 
             if page_record is None:
                 await websocket.send(json.dumps({

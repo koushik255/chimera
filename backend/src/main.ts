@@ -1,10 +1,12 @@
 import { Hono } from "hono";
 import {
-  countPagesForVolume,
-  getFirstPageForVolume,
+  countPagesForHostVolume,
+  createVolumeViewSession,
+  getFirstPageForHostVolume,
   getPageById,
   getSeriesById,
-  getVolumeById,
+  getVolumeViewSession,
+  hostServesVolume,
   listDebugHosts,
   listDebugPagesForVolume,
   listDebugSeries,
@@ -12,7 +14,7 @@ import {
   listHomeSeries,
   listHosts,
   listHostsForPage,
-  listVolumesForSeries,
+  listHostsWithVolumesForSeries,
   type RegisterManifestMessage,
   upsertManifest,
 } from "./db.ts";
@@ -65,8 +67,8 @@ app.get("/", (c) => {
   `));
 });
 
-// Show one series and list its volumes from the database.
-// The :seriesId part comes from the URL path parameter.
+// Show one series and group its volumes by host.
+// This mirrors the real model better because the available volumes depend on which host is serving them.
 app.get("/series/:seriesId", (c) => {
   const seriesId = c.req.param("seriesId");
   const series = getSeriesById(seriesId);
@@ -75,36 +77,108 @@ app.get("/series/:seriesId", (c) => {
     return c.text("Series not found", 404);
   }
 
-  const volumes = listVolumesForSeries(seriesId);
+  const rows = listHostsWithVolumesForSeries(seriesId);
+  const onlineRows = rows.filter((row) => hostSockets.has(row.host_id));
+  const hosts = new Map<string, { username: string; volumes: typeof onlineRows }>();
+
+  for (const row of onlineRows) {
+    const existing = hosts.get(row.host_id);
+    if (existing) {
+      existing.volumes.push(row);
+      continue;
+    }
+
+    hosts.set(row.host_id, {
+      username: row.username,
+      volumes: [row],
+    });
+  }
 
   return c.html(renderPage(series.title, `
     <p><a href="/">Back</a></p>
     <h1>${escapeHtml(series.title)}</h1>
-    <ul>
-      ${volumes.map((volume) => `<li><a href="/volumes/${encodeURIComponent(volume.id)}">${escapeHtml(volume.title)}</a> - ${volume.page_count} pages</li>`).join("")}
-    </ul>
+    ${[...hosts.entries()].map(([hostId, host]) => `
+      <section>
+        <h2>${escapeHtml(host.username)}</h2>
+        <ul>
+          ${host.volumes.map((volume) => `
+            <li>
+              <form method="post" action="/volume-view">
+                <input type="hidden" name="hostId" value="${escapeHtml(hostId)}" />
+                <input type="hidden" name="volumeId" value="${escapeHtml(volume.volume_id)}" />
+                <button type="submit">${escapeHtml(volume.volume_title)}</button>
+                - ${volume.page_count} pages
+              </form>
+            </li>
+          `).join("")}
+        </ul>
+      </section>
+    `).join("") || "<p>No hosts found for this series.</p>"}
   `));
 });
 
-// Show one volume and preview its first page image.
-// This lets us test DB lookup + live image relay without a full reader yet.
-app.get("/volumes/:volumeId", (c) => {
-  const volumeId = c.req.param("volumeId");
-  const volume = getVolumeById(volumeId);
+// Receive a host+volume selection from the series page.
+// The backend stores that choice under a random token, then redirects to a cleaner public URL.
+app.post("/volume-view", async (c) => {
+  const form = await c.req.formData();
+  const hostId = form.get("hostId");
+  const volumeId = form.get("volumeId");
 
-  if (!volume) {
-    return c.text("Volume not found", 404);
+  if (typeof hostId !== "string" || typeof volumeId !== "string") {
+    return c.text("Invalid host or volume selection", 400);
   }
 
-  const firstPage = getFirstPageForVolume(volumeId);
-  const pageCount = countPagesForVolume(volumeId);
+  if (!hostSockets.has(hostId)) {
+    return c.text("Selected host is offline", 503);
+  }
 
-  return c.html(renderPage(volume.title, `
-    <p><a href="/">Home</a> / <a href="/series/${encodeURIComponent(volume.series_id)}">${escapeHtml(volume.series_title)}</a></p>
-    <h1>${escapeHtml(volume.title)}</h1>
+  if (!hostServesVolume(hostId, volumeId)) {
+    return c.text("Selected host does not serve that volume", 400);
+  }
+
+  const token = crypto.randomUUID();
+  createVolumeViewSession(token, hostId, volumeId);
+  return c.redirect(`/volume-view/${encodeURIComponent(token)}`);
+});
+
+// Render a host-specific volume view using a token rather than exposing the raw host ID in the URL.
+// The token maps back to the selected host and volume inside the backend database.
+app.get("/volume-view/:token", (c) => {
+  const token = c.req.param("token");
+  const selection = getVolumeViewSession(token);
+
+  if (!selection) {
+    return c.text("Volume view not found", 404);
+  }
+
+  const pageCount = countPagesForHostVolume(selection.host_id, selection.volume_id);
+
+  return c.html(renderPage(selection.volume_title, `
+    <p><a href="/">Home</a> / <a href="/series/${encodeURIComponent(selection.series_id)}">${escapeHtml(selection.series_title)}</a></p>
+    <h1>${escapeHtml(selection.volume_title)}</h1>
+    <p>Selected host: ${escapeHtml(selection.host_username)}</p>
     <p>Page count: ${pageCount}</p>
-    ${firstPage ? `<p>First page:</p><img src="/pages/${encodeURIComponent(firstPage.id)}/image" style="max-width: 100%; height: auto;" />` : "<p>No pages found.</p>"}
+    <p>First page:</p>
+    <img src="/volume-view/${encodeURIComponent(token)}/preview" style="max-width: 100%; height: auto;" />
   `));
+});
+
+// Fetch the first page preview for the selected host+volume pair.
+// This ensures the preview comes from the chosen host instead of any host that happens to have that page.
+app.get("/volume-view/:token/preview", async (c) => {
+  const token = c.req.param("token");
+  const selection = getVolumeViewSession(token);
+
+  if (!selection) {
+    return c.text("Volume view not found", 404);
+  }
+
+  const firstPage = getFirstPageForHostVolume(selection.host_id, selection.volume_id);
+  if (!firstPage) {
+    return c.text("No pages found for this host and volume", 404);
+  }
+
+  return await relayPageFromHost(selection.host_id, firstPage.id, c);
 });
 
 // Relay one page image through the backend.
@@ -118,55 +192,12 @@ app.get("/pages/:pageId/image", async (c) => {
   }
 
   const hostRows = listHostsForPage(pageId);
-
   const onlineHost = hostRows.find((host) => hostSockets.has(host.id));
   if (!onlineHost) {
     return c.text("No online host available for this page", 503);
   }
 
-  const socket = hostSockets.get(onlineHost.id);
-  if (!socket) {
-    return c.text("Host socket missing", 503);
-  }
-
-  const requestId = crypto.randomUUID();
-
-  const imagePromise = new Promise<{ bytes: Uint8Array; contentType: string }>((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      if (pendingPageRequests.has(requestId)) {
-        pendingPageRequests.delete(requestId);
-      }
-      reject(new Error("Timed out waiting for host response"));
-    }, 10_000);
-
-    pendingPageRequests.set(requestId, {
-      hostId: onlineHost.id,
-      pageId,
-      contentType: null,
-      resolve,
-      reject,
-      timeoutId,
-    });
-  });
-
-  socket.send(JSON.stringify({
-    type: "page_request",
-    requestId,
-    pageId,
-  }));
-
-  try {
-    const image = await imagePromise;
-
-    return new Response(Uint8Array.from(image.bytes), {
-      headers: {
-        "content-type": image.contentType,
-        "cache-control": "no-store",
-      },
-    });
-  } catch (error) {
-    return c.text(`Failed to fetch page from host: ${String(error)}`, 502);
-  }
+  return await relayPageFromHost(onlineHost.id, pageId, c);
 });
 
 // Debug endpoint to inspect the raw series rows stored in SQLite.
@@ -201,6 +232,54 @@ app.get("/debug/hosts", (c) => {
     })),
   });
 });
+
+// Ask one connected host for a specific page and turn the result into a normal HTTP image response.
+// This helper is reused by both the generic page route and the token-based volume preview route.
+async function relayPageFromHost(hostId: string, pageId: string, c: { text: (text: string, status?: number) => Response }) {
+  const socket = hostSockets.get(hostId);
+  if (!socket) {
+    return c.text("Host socket missing", 503);
+  }
+
+  const requestId = crypto.randomUUID();
+
+  const imagePromise = new Promise<{ bytes: Uint8Array; contentType: string }>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      if (pendingPageRequests.has(requestId)) {
+        pendingPageRequests.delete(requestId);
+      }
+      reject(new Error("Timed out waiting for host response"));
+    }, 10_000);
+
+    pendingPageRequests.set(requestId, {
+      hostId,
+      pageId,
+      contentType: null,
+      resolve,
+      reject,
+      timeoutId,
+    });
+  });
+
+  socket.send(JSON.stringify({
+    type: "page_request",
+    requestId,
+    pageId,
+  }));
+
+  try {
+    const image = await imagePromise;
+
+    return new Response(Uint8Array.from(image.bytes), {
+      headers: {
+        "content-type": image.contentType,
+        "cache-control": "no-store",
+      },
+    });
+  } catch (error) {
+    return c.text(`Failed to fetch page from host: ${String(error)}`, 502);
+  }
+}
 
 // Upgrade an incoming HTTP request into a WebSocket used by a Python host.
 // After the socket is open, this function handles manifest registration and page-response messages.

@@ -94,6 +94,26 @@ export type DebugHostRow = {
   page_count: number;
 };
 
+export type HostSeriesVolumeRow = {
+  host_id: string;
+  username: string;
+  volume_id: string;
+  volume_title: string;
+  volume_number: number | null;
+  page_count: number;
+};
+
+export type VolumeViewSessionRow = {
+  id: string;
+  host_id: string;
+  host_username: string;
+  volume_id: string;
+  volume_title: string;
+  volume_number: number | null;
+  series_id: string;
+  series_title: string;
+};
+
 Deno.mkdirSync("./data", { recursive: true });
 const db = new Database("./data/app.db");
 
@@ -130,6 +150,25 @@ export function listVolumesForSeries(seriesId: string) {
   `).all(seriesId) as VolumeSummaryRow[];
 }
 
+export function listHostsWithVolumesForSeries(seriesId: string) {
+  return db.prepare(`
+    SELECT
+      h.id AS host_id,
+      h.username,
+      v.id AS volume_id,
+      v.title AS volume_title,
+      v.volume_number,
+      COUNT(DISTINCT p.id) AS page_count
+    FROM hosts h
+    JOIN host_pages hp ON hp.host_id = h.id
+    JOIN pages p ON p.id = hp.page_id
+    JOIN volumes v ON v.id = p.volume_id
+    WHERE v.series_id = ?
+    GROUP BY h.id, h.username, v.id, v.title, v.volume_number
+    ORDER BY h.username, v.volume_number, v.title
+  `).all(seriesId) as HostSeriesVolumeRow[];
+}
+
 export function getVolumeById(volumeId: string) {
   return db.prepare(`
     SELECT v.id, v.title, v.volume_number, s.id AS series_id, s.title AS series_title
@@ -149,8 +188,29 @@ export function getFirstPageForVolume(volumeId: string) {
   `).get(volumeId) as PagePreviewRow | undefined;
 }
 
+export function getFirstPageForHostVolume(hostId: string, volumeId: string) {
+  return db.prepare(`
+    SELECT p.id, p.page_index, p.content_type
+    FROM host_pages hp
+    JOIN pages p ON p.id = hp.page_id
+    WHERE hp.host_id = ? AND p.volume_id = ?
+    ORDER BY p.page_index
+    LIMIT 1
+  `).get(hostId, volumeId) as PagePreviewRow | undefined;
+}
+
 export function countPagesForVolume(volumeId: string) {
   const row = db.prepare(`SELECT COUNT(*) AS count FROM pages WHERE volume_id = ?`).get(volumeId) as { count: number };
+  return row.count;
+}
+
+export function countPagesForHostVolume(hostId: string, volumeId: string) {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM host_pages hp
+    JOIN pages p ON p.id = hp.page_id
+    WHERE hp.host_id = ? AND p.volume_id = ?
+  `).get(hostId, volumeId) as { count: number };
   return row.count;
 }
 
@@ -189,6 +249,44 @@ export function listDebugPagesForVolume(volumeId: string) {
     WHERE volume_id = ?
     ORDER BY page_index
   `).all(volumeId) as DebugPageRow[];
+}
+
+export function hostServesVolume(hostId: string, volumeId: string) {
+  const row = db.prepare(`
+    SELECT 1 AS ok
+    FROM host_pages hp
+    JOIN pages p ON p.id = hp.page_id
+    WHERE hp.host_id = ? AND p.volume_id = ?
+    LIMIT 1
+  `).get(hostId, volumeId) as { ok: number } | undefined;
+
+  return row !== undefined;
+}
+
+export function createVolumeViewSession(id: string, hostId: string, volumeId: string) {
+  db.prepare(`
+    INSERT INTO volume_view_sessions (id, host_id, volume_id)
+    VALUES (?, ?, ?)
+  `).run(id, hostId, volumeId);
+}
+
+export function getVolumeViewSession(id: string) {
+  return db.prepare(`
+    SELECT
+      vvs.id,
+      h.id AS host_id,
+      h.username AS host_username,
+      v.id AS volume_id,
+      v.title AS volume_title,
+      v.volume_number,
+      s.id AS series_id,
+      s.title AS series_title
+    FROM volume_view_sessions vvs
+    JOIN hosts h ON h.id = vvs.host_id
+    JOIN volumes v ON v.id = vvs.volume_id
+    JOIN series s ON s.id = v.series_id
+    WHERE vvs.id = ?
+  `).get(id) as VolumeViewSessionRow | undefined;
 }
 
 export function listDebugHosts() {
@@ -296,6 +394,15 @@ function setupDatabase() {
       PRIMARY KEY(host_id, page_id),
       FOREIGN KEY(host_id) REFERENCES hosts(id),
       FOREIGN KEY(page_id) REFERENCES pages(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS volume_view_sessions (
+      id TEXT PRIMARY KEY,
+      host_id TEXT NOT NULL,
+      volume_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(host_id) REFERENCES hosts(id),
+      FOREIGN KEY(volume_id) REFERENCES volumes(id)
     );
   `);
 }
