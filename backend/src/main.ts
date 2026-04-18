@@ -2,7 +2,6 @@ import { Hono } from "hono";
 import { registerApiRoutes } from "./api.ts";
 import {
   getPageById,
-  getPageIdForVolumeViewSession,
   getVolumeViewSession,
   listHostsForPage,
   type RegisterManifestMessage,
@@ -42,6 +41,7 @@ const app = new Hono();
 const hostSockets = new Map<string, WebSocket>();
 const socketHostIds = new WeakMap<WebSocket, string>();
 const pendingPageRequests = new Map<string, PendingPageRequest>();
+const pendingRequestIdsBySession = new Map<string, string>();
 
 registerApiRoutes(app, { hostSockets });
 
@@ -68,6 +68,7 @@ app.get("/api/volume-view/:token/preview", async (c) => {
 app.get("/api/volume-view/:token/page/:pageIndex/image", async (c) => {
   const token = c.req.param("token");
   const pageIndex = Number(c.req.param("pageIndex"));
+  const requestKind = c.req.query("prefetch") === "1" ? "prefetch" : "active";
 
   if (!Number.isInteger(pageIndex) || pageIndex < 1) {
     return c.text("Invalid page index", 400);
@@ -78,12 +79,12 @@ app.get("/api/volume-view/:token/page/:pageIndex/image", async (c) => {
     return c.text("Volume view not found", 404);
   }
 
-  const pageId = getPageIdForVolumeViewSession(token, pageIndex);
+  const pageId = selection.page_ids[pageIndex - 1];
   if (!pageId) {
     return c.text("Page not found", 404);
   }
 
-  return await relayPageFromHost(selection.host_id, pageId, c, `volume-reader:${token}`);
+  return await relayPageFromHost(selection.host_id, pageId, c, `volume-reader:${token}:${requestKind}`);
 });
 
 // Relay one page image through the backend.
@@ -126,8 +127,6 @@ async function relayPageFromHost(
       failPendingPageRequest(requestId, new Error("Timed out waiting for host response"));
     }, 10_000);
 
-    cancelSupersededSessionRequests(hostId, sessionKey);
-
     pendingPageRequests.set(requestId, {
       hostId,
       pageId,
@@ -137,6 +136,8 @@ async function relayPageFromHost(
       reject,
       timeoutId,
     });
+
+    replacePendingSessionRequest(hostId, sessionKey, requestId);
   });
 
   socket.send(JSON.stringify({
@@ -149,7 +150,7 @@ async function relayPageFromHost(
   try {
     const image = await imagePromise;
 
-    return new Response(Uint8Array.from(image.bytes), {
+    return new Response(image.bytes.buffer as ArrayBuffer, {
       headers: {
         "content-type": image.contentType,
         "cache-control": "no-store",
@@ -160,26 +161,26 @@ async function relayPageFromHost(
   }
 }
 
-function cancelSupersededSessionRequests(hostId: string, sessionKey: string | null) {
+function replacePendingSessionRequest(hostId: string, sessionKey: string | null, nextRequestId: string) {
   if (!sessionKey) {
     return;
   }
 
+  const previousRequestId = pendingRequestIdsBySession.get(sessionKey);
   const socket = hostSockets.get(hostId);
-  for (const [requestId, pending] of pendingPageRequests.entries()) {
-    if (pending.hostId !== hostId || pending.sessionKey !== sessionKey) {
-      continue;
-    }
 
+  if (previousRequestId) {
     if (socket) {
       socket.send(JSON.stringify({
         type: "cancel_page_request",
-        requestId,
+        requestId: previousRequestId,
       } satisfies CancelPageRequestMessage));
     }
 
-    failPendingPageRequest(requestId, new Error("Superseded by a newer page request"));
+    failPendingPageRequest(previousRequestId, new Error("Superseded by a newer page request"));
   }
+
+  pendingRequestIdsBySession.set(sessionKey, nextRequestId);
 }
 
 function failPendingPageRequest(requestId: string, error: Error) {
@@ -190,6 +191,7 @@ function failPendingPageRequest(requestId: string, error: Error) {
 
   clearTimeout(pending.timeoutId);
   pendingPageRequests.delete(requestId);
+  clearPendingSessionRequest(pending.sessionKey, requestId);
   pending.reject(error);
 }
 
@@ -201,6 +203,7 @@ function finishPendingPageRequest(requestId: string, bytes: Uint8Array) {
 
   clearTimeout(pending.timeoutId);
   pendingPageRequests.delete(requestId);
+  clearPendingSessionRequest(pending.sessionKey, requestId);
 
   if (!pending.contentType) {
     pending.reject(new Error("Missing content type for page response"));
@@ -343,4 +346,14 @@ function findBinaryHeaderSeparator(bytes: Uint8Array) {
   }
 
   return -1;
+}
+
+function clearPendingSessionRequest(sessionKey: string | null, requestId: string) {
+  if (!sessionKey) {
+    return;
+  }
+
+  if (pendingRequestIdsBySession.get(sessionKey) === requestId) {
+    pendingRequestIdsBySession.delete(sessionKey);
+  }
 }

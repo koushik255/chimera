@@ -202,6 +202,10 @@ function VolumeViewPage(props: { token: string }) {
 function ReaderPage(props: { token: string }) {
   const [data] = createResource(() => props.token, fetchVolumeView);
   const [pageIndex, setPageIndex] = createSignal(1);
+  const [pageImageUrls, setPageImageUrls] = createSignal<Record<number, string>>({});
+  const [imageError, setImageError] = createSignal<string | null>(null);
+  const objectUrls = new Map<number, string>();
+  const inflightFetches = new Map<number, AbortController>();
 
   createEffect(() => {
     const current = data();
@@ -230,7 +234,130 @@ function ReaderPage(props: { token: string }) {
     onCleanup(() => window.removeEventListener("keydown", onKeyDown));
   });
 
-  const imageUrl = createMemo(() => `/api/volume-view/${props.token}/page/${pageIndex()}/image`);
+  function pageImageEndpoint(page: number, prefetch = false) {
+    const prefetchQuery = prefetch ? "?prefetch=1" : "";
+    return `/api/volume-view/${props.token}/page/${page}/image${prefetchQuery}`;
+  }
+
+  function storeObjectUrl(page: number, nextObjectUrl: string) {
+    const previousObjectUrl = objectUrls.get(page);
+    if (previousObjectUrl && previousObjectUrl !== nextObjectUrl) {
+      URL.revokeObjectURL(previousObjectUrl);
+    }
+
+    objectUrls.set(page, nextObjectUrl);
+    setPageImageUrls((current) => ({
+      ...current,
+      [page]: nextObjectUrl,
+    }));
+  }
+
+  function removePageImage(page: number) {
+    const objectUrl = objectUrls.get(page);
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      objectUrls.delete(page);
+    }
+
+    inflightFetches.get(page)?.abort();
+    inflightFetches.delete(page);
+
+    setPageImageUrls((current) => {
+      if (!(page in current)) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[page];
+      return next;
+    });
+  }
+
+  async function ensurePageImageLoaded(page: number, prefetch = false) {
+    const view = data();
+    if (!view || page < 1 || page > view.volume.pageCount) {
+      return;
+    }
+
+    if (objectUrls.has(page) || inflightFetches.has(page)) {
+      return;
+    }
+
+    const controller = new AbortController();
+    inflightFetches.set(page, controller);
+
+    try {
+      const response = await fetch(pageImageEndpoint(page, prefetch), { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+      }
+
+      const imageBlob = await response.blob();
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      storeObjectUrl(page, URL.createObjectURL(imageBlob));
+
+      if (page === pageIndex()) {
+        setImageError(null);
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      if (page === pageIndex()) {
+        setImageError(String(error));
+      }
+    } finally {
+      inflightFetches.delete(page);
+    }
+  }
+
+  createEffect(() => {
+    const view = data();
+    const currentPage = pageIndex();
+    if (!view) {
+      return;
+    }
+
+    const nextPage = currentPage < view.volume.pageCount ? currentPage + 1 : null;
+    const keepPages = new Set<number>([currentPage]);
+    if (nextPage !== null) {
+      keepPages.add(nextPage);
+    }
+
+    for (const page of [...objectUrls.keys()]) {
+      if (!keepPages.has(page)) {
+        removePageImage(page);
+      }
+    }
+
+    for (const [page, controller] of inflightFetches.entries()) {
+      if (!keepPages.has(page)) {
+        controller.abort();
+        inflightFetches.delete(page);
+      }
+    }
+
+    void ensurePageImageLoaded(currentPage);
+
+    const currentPageReady = Boolean(pageImageUrls()[currentPage]);
+    if (currentPageReady && nextPage !== null) {
+      void ensurePageImageLoaded(nextPage, true);
+    }
+  });
+
+  onCleanup(() => {
+    for (const controller of inflightFetches.values()) {
+      controller.abort();
+    }
+
+    for (const objectUrl of objectUrls.values()) {
+      URL.revokeObjectURL(objectUrl);
+    }
+  });
 
   return (
     <section class="page">
@@ -248,7 +375,13 @@ function ReaderPage(props: { token: string }) {
                 <button onClick={() => setPageIndex((page) => Math.max(page - 1, 1))}>Previous</button>
                 <button onClick={() => setPageIndex((page) => Math.min(page + 1, view.volume.pageCount))}>Next</button>
               </div>
-              <img class="preview-image" src={imageUrl()} alt={`${view.volume.title} page ${pageIndex()}`} />
+              <Show when={!imageError()} fallback={<p>Failed to load page image: {imageError()}</p>}>
+                <Show when={pageImageUrls()[pageIndex()]} fallback={<p>Loading page image...</p>}>
+                  {(imageUrl) => (
+                    <img class="preview-image" src={imageUrl()} alt={`${view.volume.title} page ${pageIndex()}`} />
+                  )}
+                </Show>
+              </Show>
             </>
           )}
         </Show>
