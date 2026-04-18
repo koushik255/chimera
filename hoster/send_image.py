@@ -78,6 +78,8 @@ async def host_forever() -> None:
     print(f"Prepared manifest with {total_series} series, {total_volumes} volumes, {total_pages} pages")
 
     async with connect(WS_URL, max_size=None) as websocket:
+        request_tasks: dict[str, asyncio.Task[None]] = {}
+
         greeting = await websocket.recv()
         print("Server:")
         print(greeting)
@@ -89,55 +91,103 @@ async def host_forever() -> None:
         print(register_response)
         print("Host connected. Open http://localhost:8000 in your browser.")
 
-        async for raw_message in websocket:
-            if not isinstance(raw_message, str):
-                print("Ignoring unexpected binary message from backend")
-                continue
+        try:
+            async for raw_message in websocket:
+                if not isinstance(raw_message, str):
+                    print("Ignoring unexpected binary message from backend")
+                    continue
 
-            message = json.loads(raw_message)
-            print("Backend message:")
-            print(message)
+                message = json.loads(raw_message)
+                print("Backend message:")
+                print(message)
 
-            if message.get("type") != "page_request":
-                continue
+                message_type = message.get("type")
+                if message_type == "page_request":
+                    request_id = message.get("requestId")
+                    page_id = message.get("pageId")
 
-            page_id = message.get("pageId")
-            request_id = message.get("requestId")
-            page_path = page_lookup.get(page_id)
+                    if request_id is None or page_id is None:
+                        continue
 
-            if request_id is None or page_id is None:
-                continue
+                    existing_task = request_tasks.pop(request_id, None)
+                    if existing_task is not None:
+                        existing_task.cancel()
 
-            if page_path is None or not page_path.exists():
-                await websocket.send(json.dumps({
-                    "type": "page_error",
-                    "requestId": request_id,
-                    "pageId": page_id,
-                    "error": f"Unknown page id: {page_id}",
-                }))
-                continue
+                    task = asyncio.create_task(
+                        serve_page_request(websocket, message, page_lookup, page_metadata)
+                    )
+                    request_tasks[request_id] = task
+                    task.add_done_callback(lambda _task, rid=request_id: request_tasks.pop(rid, None))
+                    continue
 
-            page_record = page_metadata.get(page_id)
+                if message_type == "cancel_page_request":
+                    request_id = message.get("requestId")
+                    if request_id is None:
+                        continue
 
-            if page_record is None:
-                await websocket.send(json.dumps({
-                    "type": "page_error",
-                    "requestId": request_id,
-                    "pageId": page_id,
-                    "error": f"Page metadata missing for: {page_id}",
-                }))
-                continue
+                    task = request_tasks.pop(request_id, None)
+                    if task is not None:
+                        task.cancel()
+                    continue
+        finally:
+            for task in request_tasks.values():
+                task.cancel()
 
-            page_bytes = page_path.read_bytes()
+            if request_tasks:
+                await asyncio.gather(*request_tasks.values(), return_exceptions=True)
 
-            await websocket.send(json.dumps({
-                "type": "page_response",
-                "requestId": request_id,
-                "pageId": page_id,
-                "contentType": page_record["contentType"],
-            }))
-            await websocket.send(page_bytes)
-            print(f"Served page bytes for {page_id}")
+
+async def serve_page_request(
+    websocket,
+    message: dict,
+    page_lookup: dict[str, Path],
+    page_metadata: dict[str, dict],
+) -> None:
+    page_id = message.get("pageId")
+    request_id = message.get("requestId")
+    page_path = page_lookup.get(page_id)
+
+    if request_id is None or page_id is None:
+        return
+
+    if page_path is None or not page_path.exists():
+        await websocket.send(json.dumps({
+            "type": "page_error",
+            "requestId": request_id,
+            "pageId": page_id,
+            "error": f"Unknown page id: {page_id}",
+        }))
+        return
+
+    page_record = page_metadata.get(page_id)
+    if page_record is None:
+        await websocket.send(json.dumps({
+            "type": "page_error",
+            "requestId": request_id,
+            "pageId": page_id,
+            "error": f"Page metadata missing for: {page_id}",
+        }))
+        return
+
+    try:
+        page_bytes = await asyncio.to_thread(page_path.read_bytes)
+    except asyncio.CancelledError:
+        print(f"Cancelled page request for {page_id}")
+        raise
+
+    envelope = json.dumps({
+        "type": "page_response",
+        "requestId": request_id,
+        "pageId": page_id,
+        "contentType": page_record["contentType"],
+    }).encode("utf-8") + b"\n\n" + page_bytes
+
+    try:
+        await websocket.send(envelope)
+        print(f"Served page bytes for {page_id}")
+    except asyncio.CancelledError:
+        print(f"Cancelled page send for {page_id}")
+        raise
 
 
 def main() -> None:

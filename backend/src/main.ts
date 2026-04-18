@@ -23,9 +23,15 @@ type PageErrorMessage = {
   error: string;
 };
 
+type CancelPageRequestMessage = {
+  type: "cancel_page_request";
+  requestId: string;
+};
+
 type PendingPageRequest = {
   hostId: string;
   pageId: string;
+  sessionKey: string | null;
   contentType: string | null;
   resolve: (value: { bytes: Uint8Array; contentType: string }) => void;
   reject: (reason?: unknown) => void;
@@ -54,7 +60,7 @@ app.get("/api/volume-view/:token/preview", async (c) => {
     return c.text("No pages found for this host and volume", 404);
   }
 
-  return await relayPageFromHost(selection.host_id, firstPageId, c);
+  return await relayPageFromHost(selection.host_id, firstPageId, c, `volume-preview:${token}`);
 });
 
 // Relay a page image by reader page index using the precomputed session page order.
@@ -77,7 +83,7 @@ app.get("/api/volume-view/:token/page/:pageIndex/image", async (c) => {
     return c.text("Page not found", 404);
   }
 
-  return await relayPageFromHost(selection.host_id, pageId, c);
+  return await relayPageFromHost(selection.host_id, pageId, c, `volume-reader:${token}`);
 });
 
 // Relay one page image through the backend.
@@ -96,13 +102,18 @@ app.get("/pages/:pageId/image", async (c) => {
     return c.text("No online host available for this page", 503);
   }
 
-  return await relayPageFromHost(onlineHost.id, pageId, c);
+  return await relayPageFromHost(onlineHost.id, pageId, c, null);
 });
 
 
 // Ask one connected host for a specific page and turn the result into a normal HTTP image response.
 // This helper is reused by both the generic page route and the token-based volume preview route.
-async function relayPageFromHost(hostId: string, pageId: string, c: { text: (text: string, status?: number) => Response }) {
+async function relayPageFromHost(
+  hostId: string,
+  pageId: string,
+  c: { text: (text: string, status?: number) => Response },
+  sessionKey: string | null,
+) {
   const socket = hostSockets.get(hostId);
   if (!socket) {
     return c.text("Host socket missing", 503);
@@ -112,15 +123,15 @@ async function relayPageFromHost(hostId: string, pageId: string, c: { text: (tex
 
   const imagePromise = new Promise<{ bytes: Uint8Array; contentType: string }>((resolve, reject) => {
     const timeoutId = setTimeout(() => {
-      if (pendingPageRequests.has(requestId)) {
-        pendingPageRequests.delete(requestId);
-      }
-      reject(new Error("Timed out waiting for host response"));
+      failPendingPageRequest(requestId, new Error("Timed out waiting for host response"));
     }, 10_000);
+
+    cancelSupersededSessionRequests(hostId, sessionKey);
 
     pendingPageRequests.set(requestId, {
       hostId,
       pageId,
+      sessionKey,
       contentType: null,
       resolve,
       reject,
@@ -132,6 +143,7 @@ async function relayPageFromHost(hostId: string, pageId: string, c: { text: (tex
     type: "page_request",
     requestId,
     pageId,
+    sessionKey,
   }));
 
   try {
@@ -145,6 +157,55 @@ async function relayPageFromHost(hostId: string, pageId: string, c: { text: (tex
     });
   } catch (error) {
     return c.text(`Failed to fetch page from host: ${String(error)}`, 502);
+  }
+}
+
+function cancelSupersededSessionRequests(hostId: string, sessionKey: string | null) {
+  if (!sessionKey) {
+    return;
+  }
+
+  const socket = hostSockets.get(hostId);
+  for (const [requestId, pending] of pendingPageRequests.entries()) {
+    if (pending.hostId !== hostId || pending.sessionKey !== sessionKey) {
+      continue;
+    }
+
+    if (socket) {
+      socket.send(JSON.stringify({
+        type: "cancel_page_request",
+        requestId,
+      } satisfies CancelPageRequestMessage));
+    }
+
+    failPendingPageRequest(requestId, new Error("Superseded by a newer page request"));
+  }
+}
+
+function failPendingPageRequest(requestId: string, error: Error) {
+  const pending = pendingPageRequests.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  clearTimeout(pending.timeoutId);
+  pendingPageRequests.delete(requestId);
+  pending.reject(error);
+}
+
+function finishPendingPageRequest(requestId: string, bytes: Uint8Array) {
+  const pending = pendingPageRequests.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  clearTimeout(pending.timeoutId);
+  pendingPageRequests.delete(requestId);
+
+  if (!pending.contentType) {
+    pending.reject(new Error("Missing content type for page response"));
+  } else {
+    pending.resolve({ bytes, contentType: pending.contentType });
   }
 }
 
@@ -163,7 +224,7 @@ function handleHostWebSocket(req: Request): Response {
   socket.onmessage = (event) => {
     if (typeof event.data === "string") {
       try {
-        const message = JSON.parse(event.data) as RegisterManifestMessage | PageResponseHeader | PageErrorMessage;
+        const message = JSON.parse(event.data) as RegisterManifestMessage | PageErrorMessage;
 
         if (message.type === "register_manifest") {
           upsertManifest(message);
@@ -176,27 +237,13 @@ function handleHostWebSocket(req: Request): Response {
           return;
         }
 
-        if (message.type === "page_response") {
-          const pending = pendingPageRequests.get(message.requestId);
-          if (!pending) {
-            socket.send(JSON.stringify({ ok: false, error: "Unexpected page response header" }));
-            return;
-          }
-
-          pending.contentType = message.contentType;
-          return;
-        }
-
         if (message.type === "page_error") {
           const pending = pendingPageRequests.get(message.requestId);
           if (!pending) {
-            socket.send(JSON.stringify({ ok: false, error: "Unexpected page error" }));
             return;
           }
 
-          clearTimeout(pending.timeoutId);
-          pending.reject(new Error(message.error));
-          pendingPageRequests.delete(message.requestId);
+          failPendingPageRequest(message.requestId, new Error(message.error));
           return;
         }
 
@@ -214,26 +261,42 @@ function handleHostWebSocket(req: Request): Response {
       return;
     }
 
-    const pendingEntry = [...pendingPageRequests.entries()].find(([, pending]) => pending.hostId === hostId);
-    if (!pendingEntry) {
-      socket.send(JSON.stringify({ ok: false, error: "Unexpected binary message" }));
-      return;
-    }
-
-    const [requestId, pending] = pendingEntry;
-
-    if (!pending.contentType) {
-      socket.send(JSON.stringify({ ok: false, error: "Missing page response header before bytes" }));
-      return;
-    }
-
     const bytes = event.data instanceof Uint8Array
       ? Uint8Array.from(event.data)
       : new Uint8Array(event.data as ArrayBuffer);
 
-    clearTimeout(pending.timeoutId);
-    pending.resolve({ bytes, contentType: pending.contentType });
-    pendingPageRequests.delete(requestId);
+    const separator = findBinaryHeaderSeparator(bytes);
+    if (separator === -1) {
+      socket.send(JSON.stringify({ ok: false, error: "Invalid binary page response envelope" }));
+      return;
+    }
+
+    let header: PageResponseHeader;
+    try {
+      const headerText = new TextDecoder().decode(bytes.slice(0, separator));
+      header = JSON.parse(headerText) as PageResponseHeader;
+    } catch {
+      socket.send(JSON.stringify({ ok: false, error: "Invalid binary page response header" }));
+      return;
+    }
+
+    if (header.type !== "page_response") {
+      socket.send(JSON.stringify({ ok: false, error: "Unexpected binary message type" }));
+      return;
+    }
+
+    const pending = pendingPageRequests.get(header.requestId);
+    if (!pending) {
+      return;
+    }
+
+    if (pending.hostId !== hostId) {
+      socket.send(JSON.stringify({ ok: false, error: "Mismatched host for page response" }));
+      return;
+    }
+
+    pending.contentType = header.contentType;
+    finishPendingPageRequest(header.requestId, bytes.slice(separator + 2));
   };
 
   socket.onclose = () => {
@@ -242,9 +305,7 @@ function handleHostWebSocket(req: Request): Response {
       hostSockets.delete(hostId);
       for (const [requestId, pending] of pendingPageRequests.entries()) {
         if (pending.hostId === hostId) {
-          clearTimeout(pending.timeoutId);
-          pending.reject(new Error("Host disconnected"));
-          pendingPageRequests.delete(requestId);
+          failPendingPageRequest(requestId, new Error("Host disconnected"));
         }
       }
     }
@@ -273,3 +334,13 @@ Deno.serve({ port: 8000 }, (req) => {
 
 console.log("Backend running on http://localhost:8000");
 console.log("Host WebSocket endpoint: ws://localhost:8000/ws/host");
+
+function findBinaryHeaderSeparator(bytes: Uint8Array) {
+  for (let index = 0; index < bytes.length - 1; index += 1) {
+    if (bytes[index] === 0x0a && bytes[index + 1] === 0x0a) {
+      return index;
+    }
+  }
+
+  return -1;
+}
