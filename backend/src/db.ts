@@ -112,6 +112,7 @@ export type VolumeViewSessionRow = {
   volume_number: number | null;
   series_id: string;
   series_title: string;
+  page_ids: string[];
 };
 
 Deno.mkdirSync("./data", { recursive: true });
@@ -263,15 +264,27 @@ export function hostServesVolume(hostId: string, volumeId: string) {
   return row !== undefined;
 }
 
-export function createVolumeViewSession(id: string, hostId: string, volumeId: string) {
+export function listPageIdsForHostVolume(hostId: string, volumeId: string) {
+  const rows = db.prepare(`
+    SELECT p.id
+    FROM host_pages hp
+    JOIN pages p ON p.id = hp.page_id
+    WHERE hp.host_id = ? AND p.volume_id = ?
+    ORDER BY p.page_index
+  `).all(hostId, volumeId) as Array<{ id: string }>;
+
+  return rows.map((row) => row.id);
+}
+
+export function createVolumeViewSession(id: string, hostId: string, volumeId: string, pageIds: string[]) {
   db.prepare(`
-    INSERT INTO volume_view_sessions (id, host_id, volume_id)
-    VALUES (?, ?, ?)
-  `).run(id, hostId, volumeId);
+    INSERT INTO volume_view_sessions (id, host_id, volume_id, page_ids_json)
+    VALUES (?, ?, ?, ?)
+  `).run(id, hostId, volumeId, JSON.stringify(pageIds));
 }
 
 export function getVolumeViewSession(id: string) {
-  return db.prepare(`
+  const row = db.prepare(`
     SELECT
       vvs.id,
       h.id AS host_id,
@@ -280,13 +293,32 @@ export function getVolumeViewSession(id: string) {
       v.title AS volume_title,
       v.volume_number,
       s.id AS series_id,
-      s.title AS series_title
+      s.title AS series_title,
+      vvs.page_ids_json
     FROM volume_view_sessions vvs
     JOIN hosts h ON h.id = vvs.host_id
     JOIN volumes v ON v.id = vvs.volume_id
     JOIN series s ON s.id = v.series_id
     WHERE vvs.id = ?
-  `).get(id) as VolumeViewSessionRow | undefined;
+  `).get(id) as (Omit<VolumeViewSessionRow, "page_ids"> & { page_ids_json: string | null }) | undefined;
+
+  if (!row) {
+    return undefined;
+  }
+
+  return {
+    ...row,
+    page_ids: row.page_ids_json ? JSON.parse(row.page_ids_json) as string[] : [],
+  };
+}
+
+export function getPageIdForVolumeViewSession(id: string, pageIndex: number) {
+  const session = getVolumeViewSession(id);
+  if (!session) {
+    return undefined;
+  }
+
+  return session.page_ids[pageIndex - 1];
 }
 
 export function listDebugHosts() {
@@ -400,11 +432,18 @@ function setupDatabase() {
       id TEXT PRIMARY KEY,
       host_id TEXT NOT NULL,
       volume_id TEXT NOT NULL,
+      page_ids_json TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(host_id) REFERENCES hosts(id),
       FOREIGN KEY(volume_id) REFERENCES volumes(id)
     );
   `);
+
+  try {
+    db.exec(`ALTER TABLE volume_view_sessions ADD COLUMN page_ids_json TEXT`);
+  } catch {
+    // Column already exists on databases created after the migration.
+  }
 }
 
 function cleanupOrphanedRows() {

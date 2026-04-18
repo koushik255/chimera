@@ -1,20 +1,10 @@
 import { Hono } from "hono";
+import { registerApiRoutes } from "./api.ts";
 import {
-  countPagesForHostVolume,
-  createVolumeViewSession,
-  getFirstPageForHostVolume,
   getPageById,
-  getSeriesById,
+  getPageIdForVolumeViewSession,
   getVolumeViewSession,
-  hostServesVolume,
-  listDebugHosts,
-  listDebugPagesForVolume,
-  listDebugSeries,
-  listDebugVolumes,
-  listHomeSeries,
-  listHosts,
   listHostsForPage,
-  listHostsWithVolumesForSeries,
   type RegisterManifestMessage,
   upsertManifest,
 } from "./db.ts";
@@ -47,125 +37,11 @@ const hostSockets = new Map<string, WebSocket>();
 const socketHostIds = new WeakMap<WebSocket, string>();
 const pendingPageRequests = new Map<string, PendingPageRequest>();
 
-// Render a tiny homepage showing the series currently indexed in SQLite.
-// This is just a temporary server-rendered frontend for testing the pipeline.
-app.get("/", (c) => {
-  const series = listHomeSeries();
-  const hosts = listHosts();
-
-  return c.html(renderPage("Home", `
-    <h1>Manga test frontend</h1>
-    <p>Connected hosts in memory: ${hostSockets.size}</p>
-    <h2>Hosts</h2>
-    <ul>
-      ${hosts.map((host) => `<li>${escapeHtml(host.username)} (${escapeHtml(host.id)}) ${hostSockets.has(host.id) ? "[online]" : "[offline]"}</li>`).join("")}
-    </ul>
-    <h2>Series</h2>
-    <ul>
-      ${series.map((item) => `<li><a href="/series/${encodeURIComponent(item.id)}">${escapeHtml(item.title)}</a> (${item.volume_count} volumes)</li>`).join("")}
-    </ul>
-  `));
-});
-
-// Show one series and group its volumes by host.
-// This mirrors the real model better because the available volumes depend on which host is serving them.
-app.get("/series/:seriesId", (c) => {
-  const seriesId = c.req.param("seriesId");
-  const series = getSeriesById(seriesId);
-
-  if (!series) {
-    return c.text("Series not found", 404);
-  }
-
-  const rows = listHostsWithVolumesForSeries(seriesId);
-  const onlineRows = rows.filter((row) => hostSockets.has(row.host_id));
-  const hosts = new Map<string, { username: string; volumes: typeof onlineRows }>();
-
-  for (const row of onlineRows) {
-    const existing = hosts.get(row.host_id);
-    if (existing) {
-      existing.volumes.push(row);
-      continue;
-    }
-
-    hosts.set(row.host_id, {
-      username: row.username,
-      volumes: [row],
-    });
-  }
-
-  return c.html(renderPage(series.title, `
-    <p><a href="/">Back</a></p>
-    <h1>${escapeHtml(series.title)}</h1>
-    ${[...hosts.entries()].map(([hostId, host]) => `
-      <section>
-        <h2>${escapeHtml(host.username)}</h2>
-        <ul>
-          ${host.volumes.map((volume) => `
-            <li>
-              <form method="post" action="/volume-view">
-                <input type="hidden" name="hostId" value="${escapeHtml(hostId)}" />
-                <input type="hidden" name="volumeId" value="${escapeHtml(volume.volume_id)}" />
-                <button type="submit">${escapeHtml(volume.volume_title)}</button>
-                - ${volume.page_count} pages
-              </form>
-            </li>
-          `).join("")}
-        </ul>
-      </section>
-    `).join("") || "<p>No hosts found for this series.</p>"}
-  `));
-});
-
-// Receive a host+volume selection from the series page.
-// The backend stores that choice under a random token, then redirects to a cleaner public URL.
-app.post("/volume-view", async (c) => {
-  const form = await c.req.formData();
-  const hostId = form.get("hostId");
-  const volumeId = form.get("volumeId");
-
-  if (typeof hostId !== "string" || typeof volumeId !== "string") {
-    return c.text("Invalid host or volume selection", 400);
-  }
-
-  if (!hostSockets.has(hostId)) {
-    return c.text("Selected host is offline", 503);
-  }
-
-  if (!hostServesVolume(hostId, volumeId)) {
-    return c.text("Selected host does not serve that volume", 400);
-  }
-
-  const token = crypto.randomUUID();
-  createVolumeViewSession(token, hostId, volumeId);
-  return c.redirect(`/volume-view/${encodeURIComponent(token)}`);
-});
-
-// Render a host-specific volume view using a token rather than exposing the raw host ID in the URL.
-// The token maps back to the selected host and volume inside the backend database.
-app.get("/volume-view/:token", (c) => {
-  const token = c.req.param("token");
-  const selection = getVolumeViewSession(token);
-
-  if (!selection) {
-    return c.text("Volume view not found", 404);
-  }
-
-  const pageCount = countPagesForHostVolume(selection.host_id, selection.volume_id);
-
-  return c.html(renderPage(selection.volume_title, `
-    <p><a href="/">Home</a> / <a href="/series/${encodeURIComponent(selection.series_id)}">${escapeHtml(selection.series_title)}</a></p>
-    <h1>${escapeHtml(selection.volume_title)}</h1>
-    <p>Selected host: ${escapeHtml(selection.host_username)}</p>
-    <p>Page count: ${pageCount}</p>
-    <p>First page:</p>
-    <img src="/volume-view/${encodeURIComponent(token)}/preview" style="max-width: 100%; height: auto;" />
-  `));
-});
+registerApiRoutes(app, { hostSockets });
 
 // Fetch the first page preview for the selected host+volume pair.
 // This ensures the preview comes from the chosen host instead of any host that happens to have that page.
-app.get("/volume-view/:token/preview", async (c) => {
+app.get("/api/volume-view/:token/preview", async (c) => {
   const token = c.req.param("token");
   const selection = getVolumeViewSession(token);
 
@@ -173,12 +49,35 @@ app.get("/volume-view/:token/preview", async (c) => {
     return c.text("Volume view not found", 404);
   }
 
-  const firstPage = getFirstPageForHostVolume(selection.host_id, selection.volume_id);
-  if (!firstPage) {
+  const firstPageId = selection.page_ids[0];
+  if (!firstPageId) {
     return c.text("No pages found for this host and volume", 404);
   }
 
-  return await relayPageFromHost(selection.host_id, firstPage.id, c);
+  return await relayPageFromHost(selection.host_id, firstPageId, c);
+});
+
+// Relay a page image by reader page index using the precomputed session page order.
+// This avoids re-querying the database for host+volume page mapping on every page turn.
+app.get("/api/volume-view/:token/page/:pageIndex/image", async (c) => {
+  const token = c.req.param("token");
+  const pageIndex = Number(c.req.param("pageIndex"));
+
+  if (!Number.isInteger(pageIndex) || pageIndex < 1) {
+    return c.text("Invalid page index", 400);
+  }
+
+  const selection = getVolumeViewSession(token);
+  if (!selection) {
+    return c.text("Volume view not found", 404);
+  }
+
+  const pageId = getPageIdForVolumeViewSession(token, pageIndex);
+  if (!pageId) {
+    return c.text("Page not found", 404);
+  }
+
+  return await relayPageFromHost(selection.host_id, pageId, c);
 });
 
 // Relay one page image through the backend.
@@ -200,38 +99,6 @@ app.get("/pages/:pageId/image", async (c) => {
   return await relayPageFromHost(onlineHost.id, pageId, c);
 });
 
-// Debug endpoint to inspect the raw series rows stored in SQLite.
-// Useful when checking whether manifest ingestion worked correctly.
-app.get("/debug/series", (c) => {
-  return c.json(listDebugSeries());
-});
-
-// Debug endpoint to inspect volumes and their current page counts.
-// This helps verify that the scanner and manifest registration produced the expected structure.
-app.get("/debug/volumes", (c) => {
-  return c.json(listDebugVolumes());
-});
-
-// Debug endpoint to list all pages for one volume.
-// Helpful when checking ordering, IDs, and whether a rescan updated rows correctly.
-app.get("/debug/pages/:volumeId", (c) => {
-  const volumeId = c.req.param("volumeId");
-  return c.json({ volumeId, pages: listDebugPagesForVolume(volumeId) });
-});
-
-// Debug endpoint to compare hosts stored in SQLite with hosts currently connected in memory.
-// This makes it easier to spot cases where metadata exists but the live socket is offline.
-app.get("/debug/hosts", (c) => {
-  const hosts = listDebugHosts();
-
-  return c.json({
-    connectedHostIds: [...hostSockets.keys()],
-    hosts: hosts.map((host) => ({
-      ...host,
-      online: hostSockets.has(host.id),
-    })),
-  });
-});
 
 // Ask one connected host for a specific page and turn the result into a normal HTTP image response.
 // This helper is reused by both the generic page route and the token-based volume preview route.
@@ -390,37 +257,15 @@ function handleHostWebSocket(req: Request): Response {
   return response;
 }
 
-// Wrap a small HTML fragment in a complete document.
-// Keeping this helper separate makes the route handlers easier to read.
-function renderPage(title: string, body: string) {
-  return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>${escapeHtml(title)}</title>
-  </head>
-  <body>
-    ${body}
-  </body>
-</html>`;
-}
-
-// Escape user/data values before putting them into raw HTML.
-// This avoids broken markup and basic HTML injection in our temporary frontend.
-function escapeHtml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 Deno.serve({ port: 8000 }, (req) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/ws/host") {
     return handleHostWebSocket(req);
+  }
+
+  if (url.pathname === "/") {
+    return Response.json({ ok: true, message: "chimera backend running" });
   }
 
   return app.fetch(req);
