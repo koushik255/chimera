@@ -9,6 +9,7 @@ from scanner import scan_series
 WS_URL = "ws://100.114.14.97:8000/ws/host"
 SERIES_PATHS = [
     Path("D:/MANGA/Usogui"),
+    Path("D:/MANGA/MAGI"),
 ]
 HOST_ID = "windows-koushik-host"
 HOST_USERNAME = "WINDOWS-KOUSHIK"
