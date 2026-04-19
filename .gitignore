@@ -1,2 +1,9 @@
-backend/data/app.db
-hoster/__pycache__
+data/
+backend/data/
+backend/**/data/
+backend/.gocache/
+backend/.gomodcache/
+backend/cmd/server/server
+frontend/dist/
+hoster/__pycache__/
+hoster/.venv/
