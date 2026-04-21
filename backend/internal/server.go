@@ -3,6 +3,8 @@ package internal
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -17,7 +19,6 @@ import (
 const pageRequestTimeout = 10 * time.Second
 
 type App struct {
-	cfg   Config
 	store *SQLiteStore
 
 	mu                      sync.RWMutex
@@ -34,12 +35,10 @@ type hostSocket struct {
 }
 
 type pendingPageRequest struct {
-	hostID      string
-	pageID      string
-	sessionKey  string
-	contentType string
-	resultCh    chan pageResult
-	timer       *time.Timer
+	hostID     string
+	sessionKey string
+	resultCh   chan pageResult
+	timer      *time.Timer
 }
 
 type pageResult struct {
@@ -48,9 +47,22 @@ type pageResult struct {
 	err         error
 }
 
-func New(cfg Config, sqliteStore *SQLiteStore) *App {
+type seriesHostVolume struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	VolumeNumber *int   `json:"volumeNumber"`
+	PageCount    int    `json:"pageCount"`
+}
+
+type seriesHost struct {
+	HostID   string             `json:"hostId"`
+	Username string             `json:"username"`
+	Online   bool               `json:"online"`
+	Volumes  []seriesHostVolume `json:"volumes"`
+}
+
+func New(sqliteStore *SQLiteStore) *App {
 	return &App{
-		cfg:                     cfg,
 		store:                   sqliteStore,
 		hostSockets:             make(map[string]*hostSocket),
 		pendingPageRequests:     make(map[string]*pendingPageRequest),
@@ -107,53 +119,7 @@ func (a *App) handleGetSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type volume struct {
-		ID           string `json:"id"`
-		Title        string `json:"title"`
-		VolumeNumber *int   `json:"volumeNumber"`
-		PageCount    int    `json:"pageCount"`
-	}
-	type host struct {
-		HostID   string   `json:"hostId"`
-		Username string   `json:"username"`
-		Online   bool     `json:"online"`
-		Volumes  []volume `json:"volumes"`
-	}
-
-	hosts := make(map[string]*host)
-	for _, row := range rows {
-		if !a.hasHostSocket(row.HostID) {
-			continue
-		}
-
-		existing := hosts[row.HostID]
-		if existing == nil {
-			existing = &host{
-				HostID:   row.HostID,
-				Username: row.Username,
-				Online:   true,
-			}
-			hosts[row.HostID] = existing
-		}
-
-		existing.Volumes = append(existing.Volumes, volume{
-			ID:           row.VolumeID,
-			Title:        row.VolumeTitle,
-			VolumeNumber: row.VolumeNumber,
-			PageCount:    row.PageCount,
-		})
-	}
-
-	result := make([]host, 0, len(hosts))
-	for _, current := range hosts {
-		result = append(result, *current)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Username == result[j].Username {
-			return result[i].HostID < result[j].HostID
-		}
-		return result[i].Username < result[j].Username
-	})
+	result := a.buildSeriesHosts(rows)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"series": series,
@@ -168,8 +134,16 @@ func (a *App) handleCreateVolumeView(w http.ResponseWriter, r *http.Request) {
 	}
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&body); err != nil || body.HostID == "" || body.VolumeID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid host or volume selection"})
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		return
+	}
+	if body.HostID == "" || body.VolumeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "hostId and volumeId are required"})
 		return
 	}
 
@@ -333,19 +307,26 @@ func (a *App) relayPageFromHost(w http.ResponseWriter, r *http.Request, hostID, 
 	requestID := newID()
 	resultCh := make(chan pageResult, 1)
 	timer := time.AfterFunc(pageRequestTimeout, func() {
-		a.failPendingPageRequest(requestID, errors.New("Timed out waiting for host response"))
+		a.failPendingPageRequest(requestID, errors.New("timed out waiting for host response"))
 	})
 
+	var previousRequestID string
 	a.mu.Lock()
 	a.pendingPageRequests[requestID] = &pendingPageRequest{
 		hostID:     hostID,
-		pageID:     pageID,
 		sessionKey: sessionKey,
 		resultCh:   resultCh,
 		timer:      timer,
 	}
-	a.replacePendingSessionRequestLocked(hostID, sessionKey, requestID)
+	previousRequestID = a.replacePendingSessionRequestLocked(sessionKey, requestID)
 	a.mu.Unlock()
+
+	if previousRequestID != "" {
+		_ = socket.writeJSON(CancelPageRequestMessage{
+			Type:      "cancel_page_request",
+			RequestID: previousRequestID,
+		})
+	}
 
 	if err := socket.writeJSON(map[string]any{
 		"type":       "page_request",
@@ -390,7 +371,7 @@ func (a *App) handleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if hostID != "" {
 			a.unregisterHost(hostID, socket)
-			a.failPendingRequestsForHost(hostID, errors.New("Host disconnected"))
+			a.failPendingRequestsForHost(hostID, errors.New("host disconnected"))
 		}
 		_ = conn.Close()
 	}()
@@ -406,76 +387,138 @@ func (a *App) handleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch messageType {
 		case websocket.TextMessage:
-			var envelope struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(payload, &envelope); err != nil {
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Invalid JSON message"})
+			nextHostID, err := a.handleHostTextMessage(r, socket, hostID, payload)
+			if err != nil {
+				_ = socket.writeJSON(map[string]any{"ok": false, "error": err.Error()})
 				continue
 			}
-
-			switch envelope.Type {
-			case "register_manifest":
-				var message RegisterManifestMessage
-				if err := json.Unmarshal(payload, &message); err != nil {
-					_ = socket.writeJSON(map[string]any{"ok": false, "error": "Invalid JSON message"})
-					continue
-				}
-				if err := a.store.UpsertManifest(r.Context(), message); err != nil {
-					_ = socket.writeJSON(map[string]any{"ok": false, "error": err.Error()})
-					continue
-				}
-
-				if hostID != "" && hostID != message.Host.ID {
-					a.unregisterHost(hostID, socket)
-				}
-
-				hostID = message.Host.ID
-				a.registerHost(hostID, socket)
-				_ = socket.writeJSON(map[string]any{
-					"ok":      true,
-					"message": "Registered manifest for " + message.Host.Username,
-				})
-
-			case "page_error":
-				var message PageErrorMessage
-				if err := json.Unmarshal(payload, &message); err != nil {
-					_ = socket.writeJSON(map[string]any{"ok": false, "error": "Invalid JSON message"})
-					continue
-				}
-				a.failPendingPageRequest(message.RequestID, errors.New(message.Error))
-
-			default:
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Unknown message type"})
+			if nextHostID != "" {
+				hostID = nextHostID
 			}
 
 		case websocket.BinaryMessage:
-			if hostID == "" {
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Host not registered yet"})
-				continue
+			if err := a.handleHostBinaryMessage(hostID, payload); err != nil {
+				_ = socket.writeJSON(map[string]any{"ok": false, "error": err.Error()})
 			}
-
-			separator := findBinaryHeaderSeparator(payload)
-			if separator == -1 {
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Invalid binary page response envelope"})
-				continue
-			}
-
-			var header PageResponseHeader
-			if err := json.Unmarshal(payload[:separator], &header); err != nil {
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Invalid binary page response header"})
-				continue
-			}
-			if header.Type != "page_response" {
-				_ = socket.writeJSON(map[string]any{"ok": false, "error": "Unexpected binary message type"})
-				continue
-			}
-
-			a.finishPendingPageRequest(hostID, header.RequestID, header.ContentType, payload[separator+2:])
 		default:
-			_ = socket.writeJSON(map[string]any{"ok": false, "error": "Unsupported websocket message type"})
+			_ = socket.writeJSON(map[string]any{"ok": false, "error": "unsupported websocket message type"})
 		}
 	}
+}
+
+func (a *App) buildSeriesHosts(rows []HostSeriesVolumeRow) []seriesHost {
+	hosts := make(map[string]*seriesHost)
+	for _, row := range rows {
+		if !a.hasHostSocket(row.HostID) {
+			continue
+		}
+
+		host := hosts[row.HostID]
+		if host == nil {
+			host = &seriesHost{
+				HostID:   row.HostID,
+				Username: row.Username,
+				Online:   true,
+			}
+			hosts[row.HostID] = host
+		}
+
+		host.Volumes = append(host.Volumes, seriesHostVolume{
+			ID:           row.VolumeID,
+			Title:        row.VolumeTitle,
+			VolumeNumber: row.VolumeNumber,
+			PageCount:    row.PageCount,
+		})
+	}
+
+	result := make([]seriesHost, 0, len(hosts))
+	for _, host := range hosts {
+		result = append(result, *host)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Username == result[j].Username {
+			return result[i].HostID < result[j].HostID
+		}
+		return result[i].Username < result[j].Username
+	})
+
+	return result
+}
+
+func (a *App) handleHostTextMessage(r *http.Request, socket *hostSocket, currentHostID string, payload []byte) (string, error) {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return "", errors.New("invalid JSON message")
+	}
+
+	switch envelope.Type {
+	case "register_manifest":
+		return a.handleRegisterManifest(r, socket, currentHostID, payload)
+	case "page_error":
+		return currentHostID, a.handlePageError(payload)
+	default:
+		return currentHostID, errors.New("unknown message type")
+	}
+}
+
+func (a *App) handleRegisterManifest(r *http.Request, socket *hostSocket, currentHostID string, payload []byte) (string, error) {
+	var message RegisterManifestMessage
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return currentHostID, errors.New("invalid JSON message")
+	}
+	if err := validateRegisterManifestMessage(message); err != nil {
+		return currentHostID, err
+	}
+	if err := a.store.UpsertManifest(r.Context(), message); err != nil {
+		return currentHostID, err
+	}
+
+	if currentHostID != "" && currentHostID != message.Host.ID {
+		a.unregisterHost(currentHostID, socket)
+	}
+
+	a.registerHost(message.Host.ID, socket)
+	_ = socket.writeJSON(map[string]any{
+		"ok":      true,
+		"message": "Registered manifest for " + message.Host.Username,
+	})
+
+	return message.Host.ID, nil
+}
+
+func (a *App) handlePageError(payload []byte) error {
+	var message PageErrorMessage
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return errors.New("invalid JSON message")
+	}
+
+	a.failPendingPageRequest(message.RequestID, errors.New(message.Error))
+	return nil
+}
+
+func (a *App) handleHostBinaryMessage(hostID string, payload []byte) error {
+	if hostID == "" {
+		return errors.New("host not registered yet")
+	}
+
+	separator := findBinaryHeaderSeparator(payload)
+	if separator == -1 {
+		return errors.New("invalid binary page response envelope")
+	}
+
+	var header PageResponseHeader
+	if err := json.Unmarshal(payload[:separator], &header); err != nil {
+		return errors.New("invalid binary page response header")
+	}
+	if header.Type != "page_response" {
+		return errors.New("unexpected binary message type")
+	}
+
+	a.finishPendingPageRequest(hostID, header.RequestID, header.ContentType, payload[separator+2:])
+	return nil
 }
 
 func (a *App) registerHost(hostID string, socket *hostSocket) {
@@ -507,24 +550,18 @@ func (a *App) hasHostSocket(hostID string) bool {
 	return a.getHostSocket(hostID) != nil
 }
 
-func (a *App) replacePendingSessionRequestLocked(hostID, sessionKey, nextRequestID string) {
+func (a *App) replacePendingSessionRequestLocked(sessionKey, nextRequestID string) string {
 	if sessionKey == "" {
-		return
+		return ""
 	}
 
 	previousRequestID := a.pendingRequestIDsBySess[sessionKey]
-	socket := a.hostSockets[hostID]
 	if previousRequestID != "" {
-		if socket != nil {
-			_ = socket.writeJSON(CancelPageRequestMessage{
-				Type:      "cancel_page_request",
-				RequestID: previousRequestID,
-			})
-		}
-		a.failPendingPageRequestLocked(previousRequestID, errors.New("Superseded by a newer page request"))
+		a.failPendingPageRequestLocked(previousRequestID, errors.New("superseded by a newer page request"))
 	}
 
 	a.pendingRequestIDsBySess[sessionKey] = nextRequestID
+	return previousRequestID
 }
 
 func (a *App) clearPendingSessionRequestLocked(sessionKey, requestID string) {
@@ -627,4 +664,84 @@ func nullIfEmpty(value string) any {
 		return nil
 	}
 	return value
+}
+
+func validateRegisterManifestMessage(message RegisterManifestMessage) error {
+	if message.Type != "register_manifest" {
+		return fmt.Errorf("invalid message type %q", message.Type)
+	}
+	if message.Host.ID == "" {
+		return errors.New("host id is required")
+	}
+	if message.Host.Username == "" {
+		return errors.New("host username is required")
+	}
+
+	for _, series := range message.Series {
+		if err := validateManifestSeries(series); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateManifestSeries(series ManifestSeries) error {
+	if series.ID == "" {
+		return errors.New("series id is required")
+	}
+	if series.Title == "" {
+		return errors.New("series title is required")
+	}
+
+	for _, volume := range series.Volumes {
+		if err := validateManifestVolume(series.ID, volume); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateManifestVolume(seriesID string, volume ManifestVolume) error {
+	if volume.ID == "" {
+		return errors.New("volume id is required")
+	}
+	if volume.SeriesID != seriesID {
+		return fmt.Errorf("volume %q has mismatched series id", volume.ID)
+	}
+	if volume.Title == "" {
+		return errors.New("volume title is required")
+	}
+
+	for _, page := range volume.Pages {
+		if err := validateManifestPage(volume.ID, page); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateManifestPage(volumeID string, page ManifestPage) error {
+	if page.ID == "" {
+		return errors.New("page id is required")
+	}
+	if page.VolumeID != volumeID {
+		return fmt.Errorf("page %q has mismatched volume id", page.ID)
+	}
+	if page.Index < 0 {
+		return fmt.Errorf("page %q has invalid index", page.ID)
+	}
+	if page.FileName == "" {
+		return errors.New("page file name is required")
+	}
+	if page.ContentType == "" {
+		return errors.New("page content type is required")
+	}
+	if page.FileSize < 0 {
+		return fmt.Errorf("page %q has invalid file size", page.ID)
+	}
+
+	return nil
 }

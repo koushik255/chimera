@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,7 +30,9 @@ func NewSQLiteStore(databasePath string) (*SQLiteStore, error) {
 
 	db.SetMaxOpenConns(1)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	if err := configureSQLite(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -439,7 +443,10 @@ func (s *SQLiteStore) setup(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = s.db.ExecContext(ctx, `ALTER TABLE volume_view_sessions ADD COLUMN page_ids_json TEXT`)
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE volume_view_sessions ADD COLUMN page_ids_json TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add page_ids_json column: %w", err)
+	}
+
 	return nil
 }
 

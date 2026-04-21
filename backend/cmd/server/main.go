@@ -21,12 +21,15 @@ func main() {
 	}
 	defer sqliteStore.Close()
 
-	app := internal.New(cfg, sqliteStore)
+	app := internal.New(sqliteStore)
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr(),
 		Handler:           app.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("Backend running on http://localhost:%d", cfg.Port)
