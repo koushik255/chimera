@@ -61,6 +61,29 @@ a:hover {
   background: #0f172a;
 }
 
+.host-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.host-card-header h2 {
+  margin: 0;
+}
+
+.host-latency-panel {
+  min-width: 180px;
+  display: grid;
+  justify-items: end;
+  gap: 0.35rem;
+}
+
+.host-latency-value,
+.host-latency-error {
+  margin: 0;
+}
+
 .preview-image {
   max-width: 100%;
   height: auto;

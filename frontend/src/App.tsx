@@ -42,6 +42,16 @@ type VolumeViewResponse = {
   readerUrl: string;
 };
 
+type HostLatencyTestResponse = {
+  hostId: string;
+  volumeId: string;
+  pageId: string;
+  pageIndex: number;
+  elapsedMs: number;
+  bytes: number;
+  contentType: string;
+};
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {
@@ -60,6 +70,14 @@ async function fetchSeries(seriesId: string) {
 
 async function fetchVolumeView(token: string) {
   return fetchJson<VolumeViewResponse>(`/api/volume-view/${token}`);
+}
+
+async function testHostLatency(hostId: string, volumeId: string) {
+  return fetchJson<HostLatencyTestResponse>("/api/host-latency-test", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hostId, volumeId }),
+  });
 }
 
 function currentPath() {
@@ -119,6 +137,9 @@ function HomePage() {
 
 function SeriesPage(props: { seriesId: string }) {
   const [data] = createResource(() => props.seriesId, fetchSeries);
+  const [testingHostId, setTestingHostId] = createSignal<string | null>(null);
+  const [hostLatencyMs, setHostLatencyMs] = createSignal<Record<string, number>>({});
+  const [hostLatencyError, setHostLatencyError] = createSignal<Record<string, string>>({});
 
   async function selectVolume(hostId: string, volumeId: string) {
     const response = await fetchJson<{ token: string; url: string }>("/api/volume-view", {
@@ -128,6 +149,30 @@ function SeriesPage(props: { seriesId: string }) {
     });
 
     window.location.href = response.url;
+  }
+
+  async function runHostLatencyTest(hostId: string, volumeId: string) {
+    setTestingHostId(hostId);
+    setHostLatencyError((current) => {
+      const next = { ...current };
+      delete next[hostId];
+      return next;
+    });
+
+    try {
+      const response = await testHostLatency(hostId, volumeId);
+      setHostLatencyMs((current) => ({
+        ...current,
+        [hostId]: response.elapsedMs,
+      }));
+    } catch (error) {
+      setHostLatencyError((current) => ({
+        ...current,
+        [hostId]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setTestingHostId((current) => (current === hostId ? null : current));
+    }
   }
 
   return (
@@ -144,7 +189,27 @@ function SeriesPage(props: { seriesId: string }) {
                   <For each={seriesData.hosts}>
                     {(host) => (
                       <section class="host-card">
-                        <h2>{host.username}</h2>
+                        <div class="host-card-header">
+                          <h2>{host.username}</h2>
+                          <Show when={host.volumes[0]}>
+                            {(firstVolume) => (
+                              <div class="host-latency-panel">
+                                <button
+                                  disabled={testingHostId() === host.hostId}
+                                  onClick={() => void runHostLatencyTest(host.hostId, firstVolume().id)}
+                                >
+                                  {testingHostId() === host.hostId ? "Testing..." : "Test Connection"}
+                                </button>
+                                <Show when={hostLatencyMs()[host.hostId] !== undefined}>
+                                  <p class="muted host-latency-value">{hostLatencyMs()[host.hostId]} ms</p>
+                                </Show>
+                                <Show when={hostLatencyError()[host.hostId]}>
+                                  {(message) => <p class="muted host-latency-error">{message()}</p>}
+                                </Show>
+                              </div>
+                            )}
+                          </Show>
+                        </div>
                         <ul class="stack-list">
                           <For each={host.volumes}>
                             {(volume) => (

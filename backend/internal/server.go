@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,10 @@ type pageResult struct {
 	err         error
 }
 
+func logPageLifecycle(stage, requestID, hostID, pageID, sessionKey, details string) {
+	fmt.Printf("[page lifecycle] stage=%s requestID=%s hostID=%s pageID=%s sessionKey=%s %s\n", stage, requestID, hostID, pageID, sessionKey, details)
+}
+
 type seriesHostVolume struct {
 	ID           string `json:"id"`
 	Title        string `json:"title"`
@@ -78,6 +83,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /", a.handleRoot)
 	mux.HandleFunc("GET /api/series", a.handleListSeries)
 	mux.HandleFunc("GET /api/series/{seriesId}", a.handleGetSeries)
+	mux.HandleFunc("POST /api/host-latency-test", a.handleHostLatencyTest)
 	mux.HandleFunc("POST /api/volume-view", a.handleCreateVolumeView)
 	mux.HandleFunc("GET /api/volume-view/{token}", a.handleGetVolumeView)
 	mux.HandleFunc("GET /api/volume-view/{token}/preview", a.handlePreviewImage)
@@ -99,6 +105,70 @@ func (a *App) handleListSeries(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"series": series})
+}
+
+func (a *App) handleHostLatencyTest(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		HostID   string `json:"hostId"`
+		VolumeID string `json:"volumeId"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
+		return
+	}
+	if body.HostID == "" || body.VolumeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "hostId and volumeId are required"})
+		return
+	}
+	if !a.hasHostSocket(body.HostID) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Selected host is offline"})
+		return
+	}
+
+	pageIDs, err := a.store.ListPageIDsForHostVolume(r.Context(), body.HostID, body.VolumeID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(pageIDs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Selected host does not serve that volume"})
+		return
+	}
+
+	pageOffset := 4
+	if pageOffset >= len(pageIDs) {
+		pageOffset = len(pageIDs) - 1
+	}
+	pageID := pageIDs[pageOffset]
+
+	startedAt := time.Now()
+	result, err := a.requestPageFromHost(r.Context(), body.HostID, pageID, "host-latency-test:"+body.HostID+":"+body.VolumeID)
+	elapsedMs := time.Since(startedAt).Milliseconds()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":     "Failed to fetch page from host: " + err.Error(),
+			"elapsedMs": elapsedMs,
+			"pageId":    pageID,
+			"pageIndex": pageOffset + 1,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"hostId":      body.HostID,
+		"volumeId":    body.VolumeID,
+		"pageId":      pageID,
+		"pageIndex":   pageOffset + 1,
+		"elapsedMs":   elapsedMs,
+		"bytes":       len(result.bytes),
+		"contentType": result.contentType,
+	})
 }
 
 func (a *App) handleGetSeries(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +299,8 @@ func (a *App) handlePreviewImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logPageLifecycle("1_handler_selected_preview_page", "pending", selection.HostID, selection.PageIDs[0], "volume-preview:"+token, "handler=handlePreviewImage")
+
 	a.relayPageFromHost(w, r, selection.HostID, selection.PageIDs[0], "volume-preview:"+token)
 }
 
@@ -261,7 +333,9 @@ func (a *App) handleVolumePageImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pageID := selection.PageIDs[pageIndex-1]
-	a.relayPageFromHost(w, r, selection.HostID, pageID, "volume-reader:"+token+":"+requestKind)
+	sessionKey := "volume-reader:" + token + ":" + requestKind
+	logPageLifecycle("1_handler_selected_reader_page", "pending", selection.HostID, pageID, sessionKey, fmt.Sprintf("handler=handleVolumePageImage pageIndex=%d requestKind=%s", pageIndex, requestKind))
+	a.relayPageFromHost(w, r, selection.HostID, pageID, sessionKey)
 }
 
 func (a *App) handlePageImage(w http.ResponseWriter, r *http.Request) {
@@ -294,19 +368,35 @@ func (a *App) handlePageImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logPageLifecycle("1_handler_selected_direct_page", "pending", onlineHostID, page.ID, "", "handler=handlePageImage")
 	a.relayPageFromHost(w, r, onlineHostID, page.ID, "")
 }
 
 func (a *App) relayPageFromHost(w http.ResponseWriter, r *http.Request, hostID, pageID, sessionKey string) {
+	result, err := a.requestPageFromHost(r.Context(), hostID, pageID, sessionKey)
+	if err != nil {
+		http.Error(w, "Failed to fetch page from host: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	logPageLifecycle("7_backend_writing_http_response", "", hostID, pageID, sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(result.bytes), result.contentType))
+
+	w.Header().Set("content-type", result.contentType)
+	w.Header().Set("cache-control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(result.bytes)
+}
+
+func (a *App) requestPageFromHost(ctx context.Context, hostID, pageID, sessionKey string) (pageResult, error) {
 	socket := a.getHostSocket(hostID)
 	if socket == nil {
-		http.Error(w, "Host socket missing", http.StatusServiceUnavailable)
-		return
+		return pageResult{}, errors.New("host socket missing")
 	}
 
 	requestID := newID()
 	resultCh := make(chan pageResult, 1)
+	logPageLifecycle("2_backend_created_request", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
 	timer := time.AfterFunc(pageRequestTimeout, func() {
+		logPageLifecycle("6_backend_timeout_waiting_for_host", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
 		a.failPendingPageRequest(requestID, errors.New("timed out waiting for host response"))
 	})
 
@@ -322,6 +412,7 @@ func (a *App) relayPageFromHost(w http.ResponseWriter, r *http.Request, hostID, 
 	a.mu.Unlock()
 
 	if previousRequestID != "" {
+		logPageLifecycle("3_backend_cancelled_previous_request", previousRequestID, hostID, pageID, sessionKey, "reason=superseded_by_newer_request")
 		_ = socket.writeJSON(CancelPageRequestMessage{
 			Type:      "cancel_page_request",
 			RequestID: previousRequestID,
@@ -334,24 +425,24 @@ func (a *App) relayPageFromHost(w http.ResponseWriter, r *http.Request, hostID, 
 		"pageId":     pageID,
 		"sessionKey": nullIfEmpty(sessionKey),
 	}); err != nil {
+		logPageLifecycle("3_backend_failed_to_send_to_host", requestID, hostID, pageID, sessionKey, fmt.Sprintf("error=%v", err))
 		a.failPendingPageRequest(requestID, err)
-		http.Error(w, "Failed to fetch page from host: "+err.Error(), http.StatusBadGateway)
-		return
+		return pageResult{}, err
 	}
+	logPageLifecycle("3_backend_sent_request_to_host", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
 
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
-			http.Error(w, "Failed to fetch page from host: "+result.err.Error(), http.StatusBadGateway)
-			return
+			logPageLifecycle("7_backend_request_failed", requestID, hostID, pageID, sessionKey, fmt.Sprintf("error=%v", result.err))
+			return pageResult{}, result.err
 		}
-
-		w.Header().Set("content-type", result.contentType)
-		w.Header().Set("cache-control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(result.bytes)
-	case <-r.Context().Done():
-		a.failPendingPageRequest(requestID, r.Context().Err())
+		logPageLifecycle("6_backend_received_page_bytes", requestID, hostID, pageID, sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(result.bytes), result.contentType))
+		return result, nil
+	case <-ctx.Done():
+		logPageLifecycle("7_http_request_context_cancelled", requestID, hostID, pageID, sessionKey, fmt.Sprintf("error=%v", ctx.Err()))
+		a.failPendingPageRequest(requestID, ctx.Err())
+		return pageResult{}, ctx.Err()
 	}
 }
 
@@ -360,6 +451,7 @@ func (a *App) handleHostWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	fmt.Println("from handleHostWebSocket upgrading host websocket connection")
 
 	socket := &hostSocket{conn: conn}
 	_ = socket.writeJSON(map[string]any{
@@ -453,7 +545,6 @@ func (a *App) handleHostTextMessage(r *http.Request, socket *hostSocket, current
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		return "", errors.New("invalid JSON message")
 	}
-
 	switch envelope.Type {
 	case "register_manifest":
 		return a.handleRegisterManifest(r, socket, currentHostID, payload)
@@ -469,6 +560,7 @@ func (a *App) handleRegisterManifest(r *http.Request, socket *hostSocket, curren
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return currentHostID, errors.New("invalid JSON message")
 	}
+	fmt.Printf("[host websocket] stage=register_manifest_received hostID=%s username=%s series=%d\n", message.Host.ID, message.Host.Username, len(message.Series))
 	if err := validateRegisterManifestMessage(message); err != nil {
 		return currentHostID, err
 	}
@@ -494,6 +586,7 @@ func (a *App) handlePageError(payload []byte) error {
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return errors.New("invalid JSON message")
 	}
+	logPageLifecycle("5_host_reported_error", message.RequestID, "", message.PageID, "", fmt.Sprintf("error=%s", message.Error))
 
 	a.failPendingPageRequest(message.RequestID, errors.New(message.Error))
 	return nil
@@ -516,6 +609,7 @@ func (a *App) handleHostBinaryMessage(hostID string, payload []byte) error {
 	if header.Type != "page_response" {
 		return errors.New("unexpected binary message type")
 	}
+	logPageLifecycle("5_backend_received_binary_from_host", header.RequestID, hostID, header.PageID, "", fmt.Sprintf("contentType=%s payloadBytes=%d", header.ContentType, len(payload[separator+2:])))
 
 	a.finishPendingPageRequest(hostID, header.RequestID, header.ContentType, payload[separator+2:])
 	return nil
@@ -584,6 +678,7 @@ func (a *App) failPendingPageRequestLocked(requestID string, err error) {
 	if pending == nil {
 		return
 	}
+	logPageLifecycle("6_backend_marked_request_failed", requestID, pending.hostID, "", pending.sessionKey, fmt.Sprintf("error=%v", err))
 
 	delete(a.pendingPageRequests, requestID)
 	a.clearPendingSessionRequestLocked(pending.sessionKey, requestID)
@@ -600,11 +695,14 @@ func (a *App) finishPendingPageRequest(hostID, requestID, contentType string, by
 
 	pending := a.pendingPageRequests[requestID]
 	if pending == nil {
+		logPageLifecycle("6_backend_received_response_for_missing_request", requestID, hostID, "", "", "function=finishPendingPageRequest")
 		return
 	}
 	if pending.hostID != hostID {
+		logPageLifecycle("6_backend_rejected_response_host_mismatch", requestID, hostID, "", pending.sessionKey, fmt.Sprintf("expectedHostID=%s", pending.hostID))
 		return
 	}
+	logPageLifecycle("6_backend_matched_response_to_pending_request", requestID, hostID, "", pending.sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(bytes), contentType))
 
 	delete(a.pendingPageRequests, requestID)
 	a.clearPendingSessionRequestLocked(pending.sessionKey, requestID)
