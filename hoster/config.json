@@ -8,6 +8,8 @@
     "id": "windows-koushik-host",
     "username": "WINDOWS-KOUSHIK"
   },
+  "frontHost": "127.0.0.1",
+  "frontPort": 1573,
   "monitorMemory": false,
   "memoryIntervalSeconds": 60,
   "cacheBytes": 134217728,

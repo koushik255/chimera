@@ -1,11 +1,17 @@
+import argparse
 import asyncio
 import contextlib
 import json
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from urllib.parse import urlparse
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -13,10 +19,13 @@ from websockets.exceptions import ConnectionClosed
 from scanner import scan_series
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
+FRONTEND_DIR = Path(__file__).with_name("frontend")
 DEFAULT_MEMORY_INTERVAL_SECONDS = 60.0
 DEFAULT_INITIAL_RECONNECT_DELAY_SECONDS = 1
 DEFAULT_MAX_RECONNECT_DELAY_SECONDS = 300
 DEFAULT_IDLE_POLL_INTERVAL_SECONDS = 15.0
+DEFAULT_FRONT_HOST = "127.0.0.1"
+DEFAULT_FRONT_PORT = 1573
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,8 @@ class HostConfig:
     series_paths: list[Path]
     host_id: str
     host_username: str
+    front_host: str
+    front_port: int
     monitor_memory: bool
     memory_interval_seconds: float
     cache_bytes: int
@@ -134,15 +145,66 @@ class HostRuntime:
         )
 
 
-def load_config(config_path: Path = CONFIG_PATH) -> HostConfig:
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
+@dataclass
+class HostStatus:
+    frontend_enabled: bool
+    frontend_host: str
+    frontend_port: int
+    connected: bool = False
+    last_connected_at: str | None = None
+    last_disconnected_at: str | None = None
+    last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        self.lock = threading.Lock()
+
+    def mark_connected(self) -> None:
+        with self.lock:
+            self.connected = True
+            self.last_connected_at = utc_now()
+            self.last_error = None
+
+    def mark_disconnected(self, error: str | None = None) -> None:
+        with self.lock:
+            self.connected = False
+            self.last_disconnected_at = utc_now()
+            if error:
+                self.last_error = error
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "frontendEnabled": self.frontend_enabled,
+                "frontendHost": self.frontend_host,
+                "frontendPort": self.frontend_port,
+                "connected": self.connected,
+                "lastConnectedAt": self.last_connected_at,
+                "lastDisconnectedAt": self.last_disconnected_at,
+                "lastError": self.last_error,
+            }
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_host_config(raw: dict[str, Any]) -> HostConfig:
     series_paths = [Path(value) for value in raw["seriesPaths"]]
+    front_host = str(raw.get("frontHost", DEFAULT_FRONT_HOST))
+    front_port = int(raw.get("frontPort", DEFAULT_FRONT_PORT))
+
+    if not front_host:
+        raise ValueError("frontHost must not be empty")
+    if front_port <= 0 or front_port > 65535:
+        raise ValueError("frontPort must be between 1 and 65535")
 
     return HostConfig(
         ws_url=raw["wsUrl"],
         series_paths=series_paths,
         host_id=raw["host"]["id"],
         host_username=raw["host"]["username"],
+        front_host=front_host,
+        front_port=front_port,
         monitor_memory=raw.get("monitorMemory", False),
         memory_interval_seconds=float(raw.get("memoryIntervalSeconds", DEFAULT_MEMORY_INTERVAL_SECONDS)),
         cache_bytes=int(raw.get("cacheBytes", 0)),
@@ -155,6 +217,20 @@ def load_config(config_path: Path = CONFIG_PATH) -> HostConfig:
             raw.get("maxReconnectDelaySeconds", DEFAULT_MAX_RECONNECT_DELAY_SECONDS)
         ),
     )
+
+
+def load_config(config_path: Path = CONFIG_PATH) -> HostConfig:
+    raw = load_config_json(config_path)
+    return parse_host_config(raw)
+
+
+def load_config_json(config_path: Path = CONFIG_PATH) -> dict[str, Any]:
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def save_config_json(raw: dict[str, Any], config_path: Path = CONFIG_PATH) -> None:
+    parse_host_config(raw)
+    config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
 def build_manifest_payload(
@@ -213,31 +289,148 @@ def build_manifest_payload(
     return payload, page_lookup, page_metadata
 
 
-async def host_forever(config: HostConfig) -> None:
-    manifest_payload, page_lookup, page_metadata = build_manifest_payload(config)
-    page_cache = PageByteCache(
-        max_bytes=config.cache_bytes,
-        max_cacheable_page_bytes=config.max_cacheable_page_bytes,
-    )
-    runtime = HostRuntime(config=config, page_cache=page_cache)
-    total_series = len(manifest_payload["series"])
-    total_volumes = sum(len(series["volumes"]) for series in manifest_payload["series"])
-    total_pages = len(page_lookup)
+def make_frontend_handler(
+    *,
+    config_path: Path,
+    status: HostStatus,
+) -> type[BaseHTTPRequestHandler]:
+    class FrontendHandler(BaseHTTPRequestHandler):
+        server_version = "chimera-front/0.1"
 
-    print(f"Prepared manifest with {total_series} series, {total_volumes} volumes, {total_pages} pages")
-    print(
-        "Host settings: "
-        f"cache_bytes={config.cache_bytes} "
-        f"max_cacheable_page_bytes={config.max_cacheable_page_bytes} "
-        f"idle_after_seconds={config.idle_after_seconds} "
-        f"monitor_memory={config.monitor_memory}"
-    )
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/config":
+                self._write_json(HTTPStatus.OK, load_config_json(config_path))
+                return
 
+            if parsed.path == "/api/status":
+                config = load_config(config_path)
+                self._write_json(
+                    HTTPStatus.OK,
+                    {
+                        **status.snapshot(),
+                        "configPath": str(config_path),
+                        "wsUrl": config.ws_url,
+                        "seriesPaths": [str(path) for path in config.series_paths],
+                        "hostId": config.host_id,
+                        "hostUsername": config.host_username,
+                    },
+                )
+                return
+
+            self._serve_static(parsed.path)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/config":
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                return
+
+            try:
+                raw_length = self.headers.get("content-length")
+                if raw_length is None:
+                    raise ValueError("Missing content-length header")
+
+                body = self.rfile.read(int(raw_length))
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("Config payload must be a JSON object")
+
+                save_config_json(payload, config_path)
+            except (ValueError, KeyError, TypeError) as exc:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            self._write_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "message": "Config saved. Restart the host process to apply connection or port changes.",
+                },
+            )
+
+        def log_message(self, format: str, *args: Any) -> None:
+            print(f"[front] {self.address_string()} - {format % args}")
+
+        def _serve_static(self, route_path: str) -> None:
+            relative_path = route_path.lstrip("/") or "index.html"
+            if relative_path.endswith("/"):
+                relative_path += "index.html"
+
+            file_path = (FRONTEND_DIR / relative_path).resolve()
+            try:
+                file_path.relative_to(FRONTEND_DIR.resolve())
+            except ValueError:
+                self._write_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden"})
+                return
+
+            if not file_path.exists() or not file_path.is_file():
+                file_path = FRONTEND_DIR / "index.html"
+
+            content_type = "text/plain; charset=utf-8"
+            if file_path.suffix == ".html":
+                content_type = "text/html; charset=utf-8"
+            elif file_path.suffix == ".css":
+                content_type = "text/css; charset=utf-8"
+            elif file_path.suffix == ".js":
+                content_type = "application/javascript; charset=utf-8"
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", content_type)
+            self.end_headers()
+            self.wfile.write(file_path.read_bytes())
+
+        def _write_json(self, status_code: HTTPStatus, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return FrontendHandler
+
+
+def start_frontend_server(config: HostConfig, config_path: Path, status: HostStatus) -> ThreadingHTTPServer:
+    if not FRONTEND_DIR.exists():
+        raise FileNotFoundError(f"Frontend directory does not exist: {FRONTEND_DIR}")
+
+    server = ThreadingHTTPServer(
+        (config.front_host, config.front_port),
+        make_frontend_handler(config_path=config_path, status=status),
+    )
+    thread = threading.Thread(target=server.serve_forever, name="chimera-front", daemon=True)
+    thread.start()
+    print(f"Frontend available at http://{config.front_host}:{config.front_port}")
+    return server
+
+
+async def host_forever(config: HostConfig, status: HostStatus) -> None:
     reconnect_delay_seconds = config.initial_reconnect_delay_seconds
     while True:
         try:
+            manifest_payload, page_lookup, page_metadata = build_manifest_payload(config)
+            page_cache = PageByteCache(
+                max_bytes=config.cache_bytes,
+                max_cacheable_page_bytes=config.max_cacheable_page_bytes,
+            )
+            runtime = HostRuntime(config=config, page_cache=page_cache)
+            total_series = len(manifest_payload["series"])
+            total_volumes = sum(len(series["volumes"]) for series in manifest_payload["series"])
+            total_pages = len(page_lookup)
+
+            print(f"Prepared manifest with {total_series} series, {total_volumes} volumes, {total_pages} pages")
+            print(
+                "Host settings: "
+                f"cache_bytes={config.cache_bytes} "
+                f"max_cacheable_page_bytes={config.max_cacheable_page_bytes} "
+                f"idle_after_seconds={config.idle_after_seconds} "
+                f"monitor_memory={config.monitor_memory}"
+            )
+
             async with connect(config.ws_url, max_size=None) as websocket:
                 print(f"Connected to backend at {config.ws_url}")
+                status.mark_connected()
                 await serve_connection(
                     websocket=websocket,
                     manifest_payload=manifest_payload,
@@ -246,11 +439,17 @@ async def host_forever(config: HostConfig) -> None:
                     runtime=runtime,
                 )
                 reconnect_delay_seconds = config.initial_reconnect_delay_seconds
+        except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+            status.mark_disconnected(f"Invalid host config or library paths: {exc}")
+            print(f"Invalid host config or library paths: {exc}")
         except ConnectionClosed as exc:
+            status.mark_disconnected(f"Disconnected from backend: code={exc.code} reason={exc.reason or 'no reason provided'}")
             print(f"Disconnected from backend: code={exc.code} reason={exc.reason or 'no reason provided'}")
         except OSError as exc:
+            status.mark_disconnected(f"Failed to connect to backend: {exc}")
             print(f"Failed to connect to backend: {exc}")
         except Exception as exc:
+            status.mark_disconnected(f"Hoster connection loop crashed: {exc}")
             print(f"Hoster connection loop crashed: {exc}")
 
         print(f"Retrying connection in {reconnect_delay_seconds} seconds")
@@ -476,8 +675,33 @@ async def monitor_idle_mode(runtime: HostRuntime) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Chimera Python host")
+    parser.add_argument(
+        "--front",
+        action="store_true",
+        help="Serve the local frontend using the frontHost/frontPort values from config.json",
+    )
+    args = parser.parse_args()
+
     config = load_config()
-    asyncio.run(host_forever(config))
+    status = HostStatus(
+        frontend_enabled=args.front,
+        frontend_host=config.front_host,
+        frontend_port=config.front_port,
+    )
+    frontend_server: ThreadingHTTPServer | None = None
+
+    try:
+        if args.front:
+            frontend_server = start_frontend_server(config, CONFIG_PATH, status)
+
+        asyncio.run(host_forever(config, status))
+    except KeyboardInterrupt:
+        print("Host stopped")
+    finally:
+        if frontend_server is not None:
+            frontend_server.shutdown()
+            frontend_server.server_close()
 
 
 if __name__ == "__main__":
