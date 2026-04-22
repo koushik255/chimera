@@ -38,6 +38,7 @@ class HostConfig:
     monitor_memory: bool
     memory_interval_seconds: float
     cache_bytes: int
+    cache_pages: int
     max_cacheable_page_bytes: int
     idle_after_seconds: float
     initial_reconnect_delay_seconds: float
@@ -61,8 +62,9 @@ class HostManifestSummary:
 
 
 class PageByteCache:
-    def __init__(self, max_bytes: int, max_cacheable_page_bytes: int) -> None:
+    def __init__(self, max_bytes: int, max_entries: int, max_cacheable_page_bytes: int) -> None:
         self.max_bytes = max_bytes
+        self.max_entries = max_entries
         self.max_cacheable_page_bytes = max_cacheable_page_bytes
         self.entries: OrderedDict[str, bytes] = OrderedDict()
         self.total_bytes = 0
@@ -72,7 +74,7 @@ class PageByteCache:
         self.lock = asyncio.Lock()
 
     async def get(self, page_id: str) -> bytes | None:
-        if self.max_bytes <= 0:
+        if self.max_bytes <= 0 or self.max_entries <= 0:
             self.misses += 1
             return None
 
@@ -87,7 +89,7 @@ class PageByteCache:
             return page_bytes
 
     async def put(self, page_id: str, page_bytes: bytes) -> None:
-        if self.max_bytes <= 0:
+        if self.max_bytes <= 0 or self.max_entries <= 0:
             return
 
         page_size = len(page_bytes)
@@ -102,7 +104,7 @@ class PageByteCache:
             self.entries[page_id] = page_bytes
             self.total_bytes += page_size
 
-            while self.total_bytes > self.max_bytes and self.entries:
+            while (self.total_bytes > self.max_bytes or len(self.entries) > self.max_entries) and self.entries:
                 _, evicted_bytes = self.entries.popitem(last=False)
                 self.total_bytes -= len(evicted_bytes)
                 self.evictions += 1
@@ -216,11 +218,14 @@ def parse_host_config(raw: dict[str, Any]) -> HostConfig:
     series_paths = [Path(value) for value in raw["seriesPaths"]]
     front_host = str(raw.get("frontHost", DEFAULT_FRONT_HOST))
     front_port = int(raw.get("frontPort", DEFAULT_FRONT_PORT))
+    cache_pages = int(raw.get("cachePages", 1))
 
     if not front_host:
         raise ValueError("frontHost must not be empty")
     if front_port <= 0 or front_port > 65535:
         raise ValueError("frontPort must be between 1 and 65535")
+    if cache_pages < 0:
+        raise ValueError("cachePages must be 0 or greater")
 
     return HostConfig(
         ws_url=raw["wsUrl"],
@@ -232,6 +237,7 @@ def parse_host_config(raw: dict[str, Any]) -> HostConfig:
         monitor_memory=raw.get("monitorMemory", False),
         memory_interval_seconds=float(raw.get("memoryIntervalSeconds", DEFAULT_MEMORY_INTERVAL_SECONDS)),
         cache_bytes=int(raw.get("cacheBytes", 0)),
+        cache_pages=cache_pages,
         max_cacheable_page_bytes=int(raw.get("maxCacheablePageBytes", 0)),
         idle_after_seconds=float(raw.get("idleAfterSeconds", 0)),
         initial_reconnect_delay_seconds=float(
@@ -620,6 +626,7 @@ async def host_forever(
 
             page_cache = PageByteCache(
                 max_bytes=config.cache_bytes,
+                max_entries=config.cache_pages,
                 max_cacheable_page_bytes=config.max_cacheable_page_bytes,
             )
             runtime = HostRuntime(config=config, page_cache=page_cache, logger=logger)
@@ -633,6 +640,7 @@ async def host_forever(
             logger(
                 "Host settings: "
                 f"cache_bytes={config.cache_bytes} "
+                f"cache_pages={config.cache_pages} "
                 f"max_cacheable_page_bytes={config.max_cacheable_page_bytes} "
                 f"idle_after_seconds={config.idle_after_seconds} "
                 f"monitor_memory={config.monitor_memory}"

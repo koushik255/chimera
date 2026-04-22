@@ -28,6 +28,7 @@ function populateForm(config) {
   document.querySelector("#monitorMemory").checked = Boolean(config.monitorMemory);
   document.querySelector("#memoryIntervalSeconds").value = String(config.memoryIntervalSeconds ?? 60);
   document.querySelector("#cacheBytes").value = String(config.cacheBytes ?? 0);
+  document.querySelector("#cachePages").value = String(config.cachePages ?? 1);
   document.querySelector("#maxCacheablePageBytes").value = String(config.maxCacheablePageBytes ?? 0);
   document.querySelector("#idleAfterSeconds").value = String(config.idleAfterSeconds ?? 0);
   document.querySelector("#initialReconnectDelaySeconds").value = String(config.initialReconnectDelaySeconds ?? 1);
@@ -70,6 +71,7 @@ function collectConfig() {
     monitorMemory: document.querySelector("#monitorMemory").checked,
     memoryIntervalSeconds: Number(document.querySelector("#memoryIntervalSeconds").value),
     cacheBytes: Number(document.querySelector("#cacheBytes").value),
+    cachePages: Number(document.querySelector("#cachePages").value),
     maxCacheablePageBytes: Number(document.querySelector("#maxCacheablePageBytes").value),
     idleAfterSeconds: Number(document.querySelector("#idleAfterSeconds").value),
     initialReconnectDelaySeconds: Number(document.querySelector("#initialReconnectDelaySeconds").value),

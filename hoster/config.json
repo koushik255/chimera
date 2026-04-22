@@ -13,6 +13,7 @@
   "monitorMemory": false,
   "memoryIntervalSeconds": 60,
   "cacheBytes": 134217728,
+  "cachePages": 1,
   "maxCacheablePageBytes": 8388608,
   "idleAfterSeconds": 300,
   "initialReconnectDelaySeconds": 1,

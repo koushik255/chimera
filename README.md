@@ -47,6 +47,11 @@ uv run chimera-host
 
 The desktop host opens a native window with runtime status, shows the local manga library being served, and minimizes to the system tray when the window is closed.
 
+The host cache is intentionally small by default:
+- `cachePages: 1` keeps only one page in the in-memory LRU cache
+- `cacheBytes` still acts as a byte ceiling
+- `maxCacheablePageBytes` prevents unusually large images from being cached at all
+
 For the old terminal-only mode:
 
 ```bash
