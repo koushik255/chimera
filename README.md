@@ -40,6 +40,7 @@ Vite runs on `http://localhost:5173` and proxies `/api` and `/pages` to the Go b
 
 ```bash
 cd hoster
+edit config.json
 uv run python send_image.py
 ```
 
