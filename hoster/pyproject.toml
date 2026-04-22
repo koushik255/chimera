@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Very basic image sender"
 requires-python = ">=3.12"
 dependencies = [
+  "PySide6>=6.9.0",
   "psutil>=7.0.0",
   "websockets>=15.0",
 ]
@@ -11,3 +12,4 @@ dependencies = [
 [project.scripts]
 send-image = "send_image:main"
 dump-manifest = "dump_manifest:main"
+chimera-host = "gui_app:main"

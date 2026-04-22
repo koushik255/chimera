@@ -40,8 +40,18 @@ Vite runs on `http://localhost:5173` and proxies `/api` and `/pages` to the Go b
 
 ```bash
 cd hoster
+uv sync
 edit config.json
-uv run python send_image.py
+uv run chimera-host
+```
+
+The desktop host opens a native window with runtime status, shows the local manga library being served, and minimizes to the system tray when the window is closed.
+
+For the old terminal-only mode:
+
+```bash
+cd hoster
+uv run python send_image.py --front
 ```
 
 The host connects to `/ws/host`, registers its manifest, and serves page bytes back to the Go backend.
