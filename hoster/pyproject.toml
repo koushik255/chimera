@@ -13,3 +13,6 @@ dependencies = [
 send-image = "send_image:main"
 dump-manifest = "dump_manifest:main"
 chimera-host = "gui_app:main"
+
+[tool.uv]
+package = true
