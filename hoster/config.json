@@ -1,21 +1,11 @@
 {
-  "wsUrl": "ws://100.114.14.97:8000/ws/host",
+  "wsUrl": "ws://127.0.0.1:8000/ws/host",
   "seriesPaths": [
-    "D:/MANGA/Usogui",
-    "D:/MANGA/MAGI"
+    "/srv/manga/Usogui"
   ],
   "host": {
-    "id": "windows-koushik-host",
-    "username": "WINDOWS-KOUSHIK"
+    "id": "chimera-host-01",
+    "username": "chimera"
   },
-  "frontHost": "127.0.0.1",
-  "frontPort": 1573,
-  "monitorMemory": false,
-  "memoryIntervalSeconds": 60,
-  "cacheBytes": 134217728,
-  "cachePages": 1,
-  "maxCacheablePageBytes": 8388608,
-  "idleAfterSeconds": 300,
-  "initialReconnectDelaySeconds": 1,
-  "maxReconnectDelaySeconds": 300
+  "reconnectDelaySeconds": 5
 }

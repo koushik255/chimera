@@ -39,25 +39,22 @@ Vite runs on `http://localhost:5173` and proxies `/api` and `/pages` to the Go b
 ## Run the host
 
 ```bash
-cd hoster
-uv sync
-edit config.json
-uv run chimera-host
+cd /home/koushikk/chimera_hoster
+go run .
 ```
 
-The desktop host opens a native window with runtime status, shows the local manga library being served, and minimizes to the system tray when the window is closed.
+The hoster is now available as a standalone Go program in `/home/koushikk/chimera_hoster`, with its own `config.json`.
 
-The host cache is intentionally small by default:
-- `cachePages: 1` keeps only one page in the in-memory LRU cache
-- `cacheBytes` still acts as a byte ceiling
-- `maxCacheablePageBytes` prevents unusually large images from being cached at all
-
-For the old terminal-only mode:
+Useful commands:
 
 ```bash
-cd hoster
-uv run python send_image.py --front
+cd /home/koushikk/chimera_hoster
+go run . -check
+go run . -dump-manifest
 ```
+
+- `--check` validates the config and scans the manga library without starting the websocket host
+- `--dump-manifest` prints the generated registration payload
 
 The host connects to `/ws/host`, registers its manifest, and serves page bytes back to the Go backend.
 

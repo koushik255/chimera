@@ -25,6 +25,7 @@ type App struct {
 	mu                      sync.RWMutex
 	hostSockets             map[string]*hostSocket
 	pendingPageRequests     map[string]*pendingPageRequest
+	pendingRequestIDsByPage map[string]string
 	pendingRequestIDsBySess map[string]string
 
 	upgrader websocket.Upgrader
@@ -37,8 +38,9 @@ type hostSocket struct {
 
 type pendingPageRequest struct {
 	hostID     string
+	pageID     string
 	sessionKey string
-	resultCh   chan pageResult
+	waiters    []chan pageResult
 	timer      *time.Timer
 }
 
@@ -50,6 +52,10 @@ type pageResult struct {
 
 func logPageLifecycle(stage, requestID, hostID, pageID, sessionKey, details string) {
 	fmt.Printf("[page lifecycle] stage=%s requestID=%s hostID=%s pageID=%s sessionKey=%s %s\n", stage, requestID, hostID, pageID, sessionKey, details)
+}
+
+func pendingPageKey(hostID, pageID string) string {
+	return hostID + "\x00" + pageID
 }
 
 type seriesHostVolume struct {
@@ -71,6 +77,7 @@ func New(sqliteStore *SQLiteStore) *App {
 		store:                   sqliteStore,
 		hostSockets:             make(map[string]*hostSocket),
 		pendingPageRequests:     make(map[string]*pendingPageRequest),
+		pendingRequestIDsByPage: make(map[string]string),
 		pendingRequestIDsBySess: make(map[string]string),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool { return true },
@@ -394,20 +401,46 @@ func (a *App) requestPageFromHost(ctx context.Context, hostID, pageID, sessionKe
 
 	requestID := newID()
 	resultCh := make(chan pageResult, 1)
+	pageKey := pendingPageKey(hostID, pageID)
 	logPageLifecycle("2_backend_created_request", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
+
+	var previousRequestID string
+	a.mu.Lock()
+	if existingRequestID := a.pendingRequestIDsByPage[pageKey]; existingRequestID != "" {
+		if existing := a.pendingPageRequests[existingRequestID]; existing != nil {
+			existing.waiters = append(existing.waiters, resultCh)
+			if sessionKey != "" {
+				previousRequestID = a.replacePendingSessionRequestLocked(sessionKey, existingRequestID)
+			}
+			a.mu.Unlock()
+
+			if previousRequestID != "" && previousRequestID != existingRequestID {
+				logPageLifecycle("3_backend_cancelled_previous_request", previousRequestID, hostID, pageID, sessionKey, "reason=superseded_by_coalesced_page_request")
+				_ = socket.writeJSON(CancelPageRequestMessage{
+					Type:      "cancel_page_request",
+					RequestID: previousRequestID,
+				})
+			}
+
+			logPageLifecycle("3_backend_coalesced_request", existingRequestID, hostID, pageID, sessionKey, fmt.Sprintf("waiterRequestID=%s", requestID))
+			return waitForPageResult(ctx, requestID, existingRequestID, hostID, pageID, sessionKey, resultCh, func(err error) {
+				a.removePendingPageWaiter(existingRequestID, resultCh, err)
+			})
+		}
+	}
+
 	timer := time.AfterFunc(pageRequestTimeout, func() {
 		logPageLifecycle("6_backend_timeout_waiting_for_host", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
 		a.failPendingPageRequest(requestID, errors.New("timed out waiting for host response"))
 	})
-
-	var previousRequestID string
-	a.mu.Lock()
 	a.pendingPageRequests[requestID] = &pendingPageRequest{
 		hostID:     hostID,
+		pageID:     pageID,
 		sessionKey: sessionKey,
-		resultCh:   resultCh,
+		waiters:    []chan pageResult{resultCh},
 		timer:      timer,
 	}
+	a.pendingRequestIDsByPage[pageKey] = requestID
 	previousRequestID = a.replacePendingSessionRequestLocked(sessionKey, requestID)
 	a.mu.Unlock()
 
@@ -431,17 +464,23 @@ func (a *App) requestPageFromHost(ctx context.Context, hostID, pageID, sessionKe
 	}
 	logPageLifecycle("3_backend_sent_request_to_host", requestID, hostID, pageID, sessionKey, "function=requestPageFromHost")
 
+	return waitForPageResult(ctx, requestID, requestID, hostID, pageID, sessionKey, resultCh, func(err error) {
+		a.removePendingPageWaiter(requestID, resultCh, err)
+	})
+}
+
+func waitForPageResult(ctx context.Context, requestID, pendingRequestID, hostID, pageID, sessionKey string, resultCh chan pageResult, onCancel func(error)) (pageResult, error) {
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
-			logPageLifecycle("7_backend_request_failed", requestID, hostID, pageID, sessionKey, fmt.Sprintf("error=%v", result.err))
+			logPageLifecycle("7_backend_request_failed", requestID, hostID, pageID, sessionKey, fmt.Sprintf("pendingRequestID=%s error=%v", pendingRequestID, result.err))
 			return pageResult{}, result.err
 		}
-		logPageLifecycle("6_backend_received_page_bytes", requestID, hostID, pageID, sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(result.bytes), result.contentType))
+		logPageLifecycle("6_backend_received_page_bytes", requestID, hostID, pageID, sessionKey, fmt.Sprintf("pendingRequestID=%s bytes=%d contentType=%s", pendingRequestID, len(result.bytes), result.contentType))
 		return result, nil
 	case <-ctx.Done():
-		logPageLifecycle("7_http_request_context_cancelled", requestID, hostID, pageID, sessionKey, fmt.Sprintf("error=%v", ctx.Err()))
-		a.failPendingPageRequest(requestID, ctx.Err())
+		logPageLifecycle("7_http_request_context_cancelled", requestID, hostID, pageID, sessionKey, fmt.Sprintf("pendingRequestID=%s error=%v", pendingRequestID, ctx.Err()))
+		onCancel(ctx.Err())
 		return pageResult{}, ctx.Err()
 	}
 }
@@ -583,7 +622,8 @@ func (a *App) handleRegisterManifest(r *http.Request, socket *hostSocket, curren
 
 func (a *App) handlePageError(payload []byte) error {
 	var message PageErrorMessage
-	if err := json.Unmarshal(payload, &message); err != nil {
+	if err := json.Unmarshal(payload, &message); 
+	err != nil {
 		return errors.New("invalid JSON message")
 	}
 	logPageLifecycle("5_host_reported_error", message.RequestID, "", message.PageID, "", fmt.Sprintf("error=%s", message.Error))
@@ -603,9 +643,10 @@ func (a *App) handleHostBinaryMessage(hostID string, payload []byte) error {
 	}
 
 	var header PageResponseHeader
-	if err := json.Unmarshal(payload[:separator], &header); err != nil {
-		return errors.New("invalid binary page response header")
-	}
+	if err := json.Unmarshal(payload[:separator], &header); 
+	    err != nil {
+		    return errors.New("invalid binary page response header")
+	            }
 	if header.Type != "page_response" {
 		return errors.New("unexpected binary message type")
 	}
@@ -650,6 +691,9 @@ func (a *App) replacePendingSessionRequestLocked(sessionKey, nextRequestID strin
 	}
 
 	previousRequestID := a.pendingRequestIDsBySess[sessionKey]
+	if previousRequestID == nextRequestID {
+		return ""
+	}
 	if previousRequestID != "" {
 		a.failPendingPageRequestLocked(previousRequestID, errors.New("superseded by a newer page request"))
 	}
@@ -667,6 +711,34 @@ func (a *App) clearPendingSessionRequestLocked(sessionKey, requestID string) {
 	}
 }
 
+func (a *App) clearPendingPageRequestLocked(hostID, pageID, requestID string) {
+	pageKey := pendingPageKey(hostID, pageID)
+	if a.pendingRequestIDsByPage[pageKey] == requestID {
+		delete(a.pendingRequestIDsByPage, pageKey)
+	}
+}
+
+func (a *App) removePendingPageWaiter(requestID string, resultCh chan pageResult, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	pending := a.pendingPageRequests[requestID]
+	if pending == nil {
+		return
+	}
+
+	for index, waiter := range pending.waiters {
+		if waiter == resultCh {
+			pending.waiters = append(pending.waiters[:index], pending.waiters[index+1:]...)
+			break
+		}
+	}
+
+	if len(pending.waiters) == 0 {
+		a.failPendingPageRequestLocked(requestID, err)
+	}
+}
+
 func (a *App) failPendingPageRequest(requestID string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -678,14 +750,17 @@ func (a *App) failPendingPageRequestLocked(requestID string, err error) {
 	if pending == nil {
 		return
 	}
-	logPageLifecycle("6_backend_marked_request_failed", requestID, pending.hostID, "", pending.sessionKey, fmt.Sprintf("error=%v", err))
+	logPageLifecycle("6_backend_marked_request_failed", requestID, pending.hostID, pending.pageID, pending.sessionKey, fmt.Sprintf("error=%v", err))
 
 	delete(a.pendingPageRequests, requestID)
+	a.clearPendingPageRequestLocked(pending.hostID, pending.pageID, requestID)
 	a.clearPendingSessionRequestLocked(pending.sessionKey, requestID)
 	pending.timer.Stop()
-	select {
-	case pending.resultCh <- pageResult{err: err}:
-	default:
+	for _, waiter := range pending.waiters {
+		select {
+		case waiter <- pageResult{err: err}:
+		default:
+		}
 	}
 }
 
@@ -699,17 +774,20 @@ func (a *App) finishPendingPageRequest(hostID, requestID, contentType string, by
 		return
 	}
 	if pending.hostID != hostID {
-		logPageLifecycle("6_backend_rejected_response_host_mismatch", requestID, hostID, "", pending.sessionKey, fmt.Sprintf("expectedHostID=%s", pending.hostID))
+		logPageLifecycle("6_backend_rejected_response_host_mismatch", requestID, hostID, pending.pageID, pending.sessionKey, fmt.Sprintf("expectedHostID=%s", pending.hostID))
 		return
 	}
-	logPageLifecycle("6_backend_matched_response_to_pending_request", requestID, hostID, "", pending.sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(bytes), contentType))
+	logPageLifecycle("6_backend_matched_response_to_pending_request", requestID, hostID, pending.pageID, pending.sessionKey, fmt.Sprintf("bytes=%d contentType=%s", len(bytes), contentType))
 
 	delete(a.pendingPageRequests, requestID)
+	a.clearPendingPageRequestLocked(pending.hostID, pending.pageID, requestID)
 	a.clearPendingSessionRequestLocked(pending.sessionKey, requestID)
 	pending.timer.Stop()
-	select {
-	case pending.resultCh <- pageResult{bytes: bytes, contentType: contentType}:
-	default:
+	for _, waiter := range pending.waiters {
+		select {
+		case waiter <- pageResult{bytes: bytes, contentType: contentType}:
+		default:
+		}
 	}
 }
 

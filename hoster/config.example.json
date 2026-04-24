@@ -1,0 +1,12 @@
+{
+  "wsUrl": "ws://your-server:8000/ws/host",
+  "seriesPaths": [
+    "/srv/manga/Usogui",
+    "/srv/manga/MAGI"
+  ],
+  "host": {
+    "id": "vps-host-01",
+    "username": "chimera-vps"
+  },
+  "reconnectDelaySeconds": 5
+}

@@ -86,9 +86,10 @@ function currentPath() {
 
 export default function App() {
   const path = createMemo(currentPath);
+  const isReaderRoute = createMemo(() => path().startsWith("/read/"));
 
   return (
-    <main class="app-shell">
+    <main class={`app-shell${isReaderRoute() ? " app-shell--reader" : ""}`}>
       <Switch>
         <Match when={path() === "/"}>
           <HomePage />
@@ -269,8 +270,46 @@ function ReaderPage(props: { token: string }) {
   const [pageIndex, setPageIndex] = createSignal(1);
   const [pageImageUrls, setPageImageUrls] = createSignal<Record<number, string>>({});
   const [imageError, setImageError] = createSignal<string | null>(null);
+  const [hasRestoredProgress, setHasRestoredProgress] = createSignal(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
+  const [isFullscreen, setIsFullscreen] = createSignal(Boolean(document.fullscreenElement));
   const objectUrls = new Map<number, string>();
   const inflightFetches = new Map<number, AbortController>();
+  const progressStorageKey = createMemo(() => `chimera:reader-progress:${props.token}`);
+  const progressPercent = createMemo(() => {
+    const view = data();
+    if (!view || view.volume.pageCount === 0) {
+      return 0;
+    }
+
+    return Math.round((pageIndex() / view.volume.pageCount) * 100);
+  });
+
+  function clampPage(page: number, pageCount: number) {
+    return Math.min(Math.max(page, 1), pageCount || 1);
+  }
+
+  function changePage(nextPage: number) {
+    const view = data();
+    if (!view) {
+      return;
+    }
+
+    setPageIndex(clampPage(nextPage, view.volume.pageCount));
+  }
+
+  function stepPage(delta: number) {
+    changePage(pageIndex() + delta);
+  }
+
+  async function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      return;
+    }
+
+    await document.documentElement.requestFullscreen();
+  }
 
   createEffect(() => {
     const current = data();
@@ -280,23 +319,75 @@ function ReaderPage(props: { token: string }) {
   });
 
   createEffect(() => {
+    const view = data();
+    if (!view || hasRestoredProgress()) {
+      return;
+    }
+
+    const storedPage = Number.parseInt(window.localStorage.getItem(progressStorageKey()) ?? "", 10);
+    if (Number.isFinite(storedPage)) {
+      setPageIndex(clampPage(storedPage, view.volume.pageCount));
+    }
+
+    setHasRestoredProgress(true);
+  });
+
+  createEffect(() => {
+    const view = data();
+    if (!view || !hasRestoredProgress()) {
+      return;
+    }
+
+    window.localStorage.setItem(progressStorageKey(), String(pageIndex()));
+  });
+
+  createEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const current = data();
       if (!current) {
         return;
       }
 
-      if (event.key === "ArrowRight") {
-        setPageIndex((page) => Math.min(page + 1, current.volume.pageCount));
+      const target = event.target;
+      if (target instanceof HTMLElement) {
+        const tagName = target.tagName.toLowerCase();
+        if (target.isContentEditable || ["input", "textarea", "select", "button"].includes(tagName)) {
+          return;
+        }
       }
 
-      if (event.key === "ArrowLeft") {
-        setPageIndex((page) => Math.max(page - 1, 1));
+      if (event.key === "ArrowRight" || event.key === "d" || event.key === "D" || event.key === " ") {
+        event.preventDefault();
+        changePage(pageIndex() + 1);
+      }
+
+      if (event.key === "ArrowLeft" || event.key === "a" || event.key === "A") {
+        event.preventDefault();
+        changePage(pageIndex() - 1);
+      }
+
+      if (event.key === "f" || event.key === "F") {
+        event.preventDefault();
+        void toggleFullscreen();
+      }
+
+      if (event.key === "h" || event.key === "H") {
+        event.preventDefault();
+        setSidebarCollapsed((collapsed) => !collapsed);
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     onCleanup(() => window.removeEventListener("keydown", onKeyDown));
+  });
+
+  createEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    onCleanup(() => document.removeEventListener("fullscreenchange", onFullscreenChange));
   });
 
   function pageImageEndpoint(page: number, prefetch = false) {
@@ -425,28 +516,119 @@ function ReaderPage(props: { token: string }) {
   });
 
   return (
-    <section class="page">
+    <section class={`page reader-page${sidebarCollapsed() ? " reader-page--collapsed" : ""}`}>
       <Show when={!data.loading} fallback={<p>Loading reader...</p>}>
         <Show when={data()} keyed>
           {(view) => (
             <>
-              <p>
-                <a href={`/volume-view/${view.token}`}>Back to volume</a>
-              </p>
-              <h1>{view.volume.title}</h1>
-              <p class="muted">Host: {view.host.username}</p>
-              <p class="muted">Page {pageIndex()} / {view.volume.pageCount}</p>
-              <div class="reader-controls">
-                <button onClick={() => setPageIndex((page) => Math.max(page - 1, 1))}>Previous</button>
-                <button onClick={() => setPageIndex((page) => Math.min(page + 1, view.volume.pageCount))}>Next</button>
-              </div>
-              <Show when={!imageError()} fallback={<p>Failed to load page image: {imageError()}</p>}>
-                <Show when={pageImageUrls()[pageIndex()]} fallback={<p>Loading page image...</p>}>
+              <div class="reader-layout">
+                <aside class={`reader-sidebar${sidebarCollapsed() ? " reader-sidebar--collapsed" : ""}`}>
+                  <div class="reader-sidebar-header">
+                    <Show
+                      when={!sidebarCollapsed()}
+                      fallback={
+                        <button class="reader-sidebar-toggle reader-sidebar-toggle--collapsed" onClick={() => setSidebarCollapsed(false)}>
+                          Open panel
+                        </button>
+                      }
+                    >
+                      <div class="reader-sidebar-brand">
+                        <div>
+                          <p class="reader-sidebar-eyebrow">Reader</p>
+                          <p class="reader-sidebar-title">Chimera</p>
+                        </div>
+                        <button class="reader-sidebar-toggle" onClick={() => setSidebarCollapsed(true)}>
+                          Collapse
+                        </button>
+                      </div>
+                    </Show>
+                  </div>
+                  <Show when={!sidebarCollapsed()}>
+                    <div class="reader-sidebar-content">
+                      <div class="reader-sidebar-section">
+                        <a class="reader-sidebar-link" href={`/volume-view/${view.token}`}>Back to volume</a>
+                      </div>
+                      <div class="reader-sidebar-section">
+                        <p class="reader-series">{view.series.title}</p>
+                        <h1 class="reader-volume-title">{view.volume.title}</h1>
+                        <p class="reader-host-meta">Hosted by {view.host.username}</p>
+                      </div>
+                      <div class="reader-sidebar-section">
+                        <div class="reader-progress-panel">
+                          <label class="reader-page-jump">
+                            <span>Page</span>
+                            <input
+                              type="number"
+                              min="1"
+                              max={view.volume.pageCount}
+                              value={pageIndex()}
+                              onInput={(event) => {
+                                const nextPage = Number.parseInt(event.currentTarget.value, 10);
+                                if (Number.isFinite(nextPage)) {
+                                  changePage(nextPage);
+                                }
+                              }}
+                            />
+                          </label>
+                          <p class="reader-progress-fraction">{pageIndex()} / {view.volume.pageCount}</p>
+                          <div class="reader-progress-track" aria-hidden="true">
+                            <div class="reader-progress-fill" style={{ width: `${progressPercent()}%` }} />
+                          </div>
+                          <p class="reader-progress-caption">{progressPercent()}% read</p>
+                        </div>
+                      </div>
+                      <div class="reader-sidebar-section">
+                        <div class="reader-controls">
+                          <button disabled={pageIndex() <= 1} onClick={() => stepPage(-1)}>Previous</button>
+                          <button disabled={pageIndex() >= view.volume.pageCount} onClick={() => stepPage(1)}>Next</button>
+                        </div>
+                      </div>
+                      <div class="reader-sidebar-section">
+                        <div class="reader-actions reader-actions--stacked">
+                          <button onClick={() => void toggleFullscreen()}>
+                            {isFullscreen() ? "Exit fullscreen" : "Fullscreen"}
+                          </button>
+                        </div>
+                        <p class="muted reader-shortcuts">Shortcuts: A/Left previous, D/Right/Space next, F fullscreen, H toggle panel.</p>
+                      </div>
+                    </div>
+                  </Show>
+                </aside>
+                <div class="reader-main">
+              <Show
+                when={!imageError()}
+                fallback={
+                  <div class="reader-status-card">
+                    <p>Failed to load page image: {imageError()}</p>
+                    <button onClick={() => void ensurePageImageLoaded(pageIndex())}>Retry page</button>
+                  </div>
+                }
+              >
+                <Show
+                  when={pageImageUrls()[pageIndex()]}
+                  fallback={<div class="reader-status-card"><p>Loading page image...</p></div>}
+                >
                   {(imageUrl) => (
-                    <img class="preview-image" src={imageUrl()} alt={`${view.volume.title} page ${pageIndex()}`} />
+                    <div class="reader-stage">
+                      <button
+                        class="reader-hit-zone reader-hit-zone--left"
+                        aria-label="Previous page"
+                        disabled={pageIndex() <= 1}
+                        onClick={() => stepPage(-1)}
+                      />
+                      <img class="reader-image" src={imageUrl()} alt={`${view.volume.title} page ${pageIndex()}`} />
+                      <button
+                        class="reader-hit-zone reader-hit-zone--right"
+                        aria-label="Next page"
+                        disabled={pageIndex() >= view.volume.pageCount}
+                        onClick={() => stepPage(1)}
+                      />
+                    </div>
                   )}
                 </Show>
               </Show>
+                </div>
+              </div>
             </>
           )}
         </Show>
