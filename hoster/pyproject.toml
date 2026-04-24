@@ -1,8 +1,0 @@
-[project]
-name = "simple-hoster"
-version = "0.1.0"
-description = "Minimal Chimera manga host"
-requires-python = ">=3.12"
-dependencies = [
-  "websockets>=15.0",
-]
