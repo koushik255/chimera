@@ -452,7 +452,10 @@ func (s *SQLiteStore) setup(ctx context.Context) error {
 
 func (s *SQLiteStore) cleanupOrphanedRows(ctx context.Context, tx *sql.Tx) error {
 	queries := []string{
+		`DELETE FROM volume_view_sessions WHERE host_id NOT IN (SELECT id FROM hosts)`,
+		`DELETE FROM volume_view_sessions WHERE volume_id NOT IN (SELECT id FROM volumes)`,
 		`DELETE FROM pages WHERE id NOT IN (SELECT DISTINCT page_id FROM host_pages)`,
+		`DELETE FROM volume_view_sessions WHERE volume_id NOT IN (SELECT DISTINCT volume_id FROM pages)`,
 		`DELETE FROM volumes WHERE id NOT IN (SELECT DISTINCT volume_id FROM pages)`,
 		`DELETE FROM series WHERE id NOT IN (SELECT DISTINCT series_id FROM volumes)`,
 	}

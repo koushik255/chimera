@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from "solid-js";
+import { useEffect, useRef, useState } from "react";
 
 type SeriesSummary = {
   id: string;
@@ -52,11 +52,18 @@ type HostLatencyTestResponse = {
   contentType: string;
 };
 
+type ResourceState<T> = {
+  data: T | null;
+  error: string | null;
+  loading: boolean;
+};
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
+
   return response.json() as Promise<T>;
 }
 
@@ -80,67 +87,87 @@ async function testHostLatency(hostId: string, volumeId: string) {
   });
 }
 
-function currentPath() {
-  return window.location.pathname;
-}
+function useJsonResource<T>(key: string | null, loader: (key: string) => Promise<T>): ResourceState<T> {
+  const [state, setState] = useState<ResourceState<T>>({
+    data: null,
+    error: null,
+    loading: true,
+  });
 
-export default function App() {
-  const path = createMemo(currentPath);
-  const isReaderRoute = createMemo(() => path().startsWith("/read/"));
+  useEffect(() => {
+    if (key === null) {
+      setState({ data: null, error: null, loading: false });
+      return;
+    }
 
-  return (
-    <main class={`app-shell${isReaderRoute() ? " app-shell--reader" : ""}`}>
-      <Switch>
-        <Match when={path() === "/"}>
-          <HomePage />
-        </Match>
-        <Match when={path().startsWith("/series/")}>
-          <SeriesPage seriesId={decodeURIComponent(path().replace("/series/", ""))} />
-        </Match>
-        <Match when={path().startsWith("/read/")}>
-          <ReaderPage token={decodeURIComponent(path().replace("/read/", ""))} />
-        </Match>
-        <Match when={path().startsWith("/volume-view/")}>
-          <VolumeViewPage token={decodeURIComponent(path().replace("/volume-view/", ""))} />
-        </Match>
-        <Match when={true}>
-          <NotFoundPage />
-        </Match>
-      </Switch>
-    </main>
-  );
+    let cancelled = false;
+    setState((current) => ({
+      data: current.data,
+      error: null,
+      loading: true,
+    }));
+
+    void loader(key)
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+
+        setState({
+          data,
+          error: null,
+          loading: false,
+        });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+
+        setState({
+          data: null,
+          error: error instanceof Error ? error.message : String(error),
+          loading: false,
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [key, loader]);
+
+  return state;
 }
 
 function HomePage() {
-  const [data] = createResource(fetchSeriesList);
+  const { data, error, loading } = useJsonResource("home", fetchSeriesList);
 
   return (
-    <section class="page">
+    <section className="page">
       <h1>chimera</h1>
-      <p class="muted">Series indexed by the backend.</p>
-      <Show when={!data.loading} fallback={<p>Loading series...</p>}>
-        <Show when={data()?.series.length} fallback={<p>No series found.</p>}>
-          <ul class="stack-list">
-            <For each={data()?.series ?? []}>
-              {(series) => (
-                <li>
-                  <a href={`/series/${series.id}`}>{series.title}</a>
-                  <span class="muted"> — {series.volume_count} volumes</span>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Show>
+      <p className="muted">Series indexed by the backend.</p>
+      {loading ? <p>Loading series...</p> : null}
+      {!loading && error ? <p>Failed to load series: {error}</p> : null}
+      {!loading && !error && (data?.series.length ?? 0) === 0 ? <p>No series found.</p> : null}
+      {!loading && !error && (data?.series.length ?? 0) > 0 ? (
+        <ul className="stack-list">
+          {data?.series.map((series) => (
+            <li key={series.id}>
+              <a href={`/series/${series.id}`}>{series.title}</a>
+              <span className="muted"> - {series.volume_count} volumes</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </section>
   );
 }
 
 function SeriesPage(props: { seriesId: string }) {
-  const [data] = createResource(() => props.seriesId, fetchSeries);
-  const [testingHostId, setTestingHostId] = createSignal<string | null>(null);
-  const [hostLatencyMs, setHostLatencyMs] = createSignal<Record<string, number>>({});
-  const [hostLatencyError, setHostLatencyError] = createSignal<Record<string, string>>({});
+  const { data, error, loading } = useJsonResource(props.seriesId, fetchSeries);
+  const [testingHostId, setTestingHostId] = useState<string | null>(null);
+  const [hostLatencyMs, setHostLatencyMs] = useState<Record<string, number>>({});
+  const [hostLatencyError, setHostLatencyError] = useState<Record<string, string>>({});
 
   async function selectVolume(hostId: string, volumeId: string) {
     const response = await fetchJson<{ token: string; url: string }>("/api/volume-view", {
@@ -177,129 +204,116 @@ function SeriesPage(props: { seriesId: string }) {
   }
 
   return (
-    <section class="page">
+    <section className="page">
       <p><a href="/">Back</a></p>
-      <Show when={!data.loading} fallback={<p>Loading series...</p>}>
-        <Show when={data()} keyed>
-          {(seriesData) => (
-            <>
-              <h1>{seriesData.series.title}</h1>
-              <p class="muted">Only online hosts are shown.</p>
-              <Show when={seriesData.hosts.length} fallback={<p>No online hosts for this series.</p>}>
-                <div class="host-sections">
-                  <For each={seriesData.hosts}>
-                    {(host) => (
-                      <section class="host-card">
-                        <div class="host-card-header">
-                          <h2>{host.username}</h2>
-                          <Show when={host.volumes[0]}>
-                            {(firstVolume) => (
-                              <div class="host-latency-panel">
-                                <button
-                                  disabled={testingHostId() === host.hostId}
-                                  onClick={() => void runHostLatencyTest(host.hostId, firstVolume().id)}
-                                >
-                                  {testingHostId() === host.hostId ? "Testing..." : "Test Connection"}
-                                </button>
-                                <Show when={hostLatencyMs()[host.hostId] !== undefined}>
-                                  <p class="muted host-latency-value">{hostLatencyMs()[host.hostId]} ms</p>
-                                </Show>
-                                <Show when={hostLatencyError()[host.hostId]}>
-                                  {(message) => <p class="muted host-latency-error">{message()}</p>}
-                                </Show>
-                              </div>
-                            )}
-                          </Show>
+      {loading ? <p>Loading series...</p> : null}
+      {!loading && error ? <p>Failed to load series: {error}</p> : null}
+      {!loading && !error && data ? (
+        <>
+          <h1>{data.series.title}</h1>
+          <p className="muted">Only online hosts are shown.</p>
+          {data.hosts.length === 0 ? <p>No online hosts for this series.</p> : null}
+          {data.hosts.length > 0 ? (
+            <div className="host-sections">
+              {data.hosts.map((host) => {
+                const firstVolume = host.volumes[0];
+                return (
+                  <section className="host-card" key={host.hostId}>
+                    <div className="host-card-header">
+                      <h2>{host.username}</h2>
+                      {firstVolume ? (
+                        <div className="host-latency-panel">
+                          <button
+                            disabled={testingHostId === host.hostId}
+                            onClick={() => void runHostLatencyTest(host.hostId, firstVolume.id)}
+                          >
+                            {testingHostId === host.hostId ? "Testing..." : "Test Connection"}
+                          </button>
+                          {hostLatencyMs[host.hostId] !== undefined ? (
+                            <p className="muted host-latency-value">{hostLatencyMs[host.hostId]} ms</p>
+                          ) : null}
+                          {hostLatencyError[host.hostId] ? (
+                            <p className="muted host-latency-error">{hostLatencyError[host.hostId]}</p>
+                          ) : null}
                         </div>
-                        <ul class="stack-list">
-                          <For each={host.volumes}>
-                            {(volume) => (
-                              <li>
-                                <button onClick={() => void selectVolume(host.hostId, volume.id)}>
-                                  {volume.title}
-                                </button>
-                                <span class="muted"> — {volume.pageCount} pages</span>
-                              </li>
-                            )}
-                          </For>
-                        </ul>
-                      </section>
-                    )}
-                  </For>
-                </div>
-              </Show>
-            </>
-          )}
-        </Show>
-      </Show>
+                      ) : null}
+                    </div>
+                    <ul className="stack-list">
+                      {host.volumes.map((volume) => (
+                        <li key={volume.id}>
+                          <button onClick={() => void selectVolume(host.hostId, volume.id)}>
+                            {volume.title}
+                          </button>
+                          <span className="muted"> - {volume.pageCount} pages</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                );
+              })}
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </section>
   );
 }
 
 function VolumeViewPage(props: { token: string }) {
-  const [data] = createResource(() => props.token, fetchVolumeView);
+  const { data, error, loading } = useJsonResource(props.token, fetchVolumeView);
 
   return (
-    <section class="page">
-      <Show when={!data.loading} fallback={<p>Loading volume...</p>}>
-        <Show when={data()} keyed>
-          {(view) => (
-            <>
-              <p>
-                <a href="/">Home</a>
-                <span class="muted"> / </span>
-                <a href={`/series/${view.series.id}`}>{view.series.title}</a>
-              </p>
-              <h1>{view.volume.title}</h1>
-              <p class="muted">Selected host: {view.host.username}</p>
-              <p class="muted">Page count: {view.volume.pageCount}</p>
-              <img class="preview-image" src={view.previewImageUrl} alt={`${view.volume.title} preview`} />
-              <p>
-                <a href={view.readerUrl}>Open reader</a>
-              </p>
-            </>
-          )}
-        </Show>
-      </Show>
+    <section className="page">
+      {loading ? <p>Loading volume...</p> : null}
+      {!loading && error ? <p>Failed to load volume: {error}</p> : null}
+      {!loading && !error && data ? (
+        <>
+          <p>
+            <a href="/">Home</a>
+            <span className="muted"> / </span>
+            <a href={`/series/${data.series.id}`}>{data.series.title}</a>
+          </p>
+          <h1>{data.volume.title}</h1>
+          <p className="muted">Selected host: {data.host.username}</p>
+          <p className="muted">Page count: {data.volume.pageCount}</p>
+          <img className="preview-image" src={data.previewImageUrl} alt={`${data.volume.title} preview`} />
+          <p>
+            <a href={data.readerUrl}>Open reader</a>
+          </p>
+        </>
+      ) : null}
     </section>
   );
 }
 
 function ReaderPage(props: { token: string }) {
-  const [data] = createResource(() => props.token, fetchVolumeView);
-  const [pageIndex, setPageIndex] = createSignal(1);
-  const [pageImageUrls, setPageImageUrls] = createSignal<Record<number, string>>({});
-  const [imageError, setImageError] = createSignal<string | null>(null);
-  const [hasRestoredProgress, setHasRestoredProgress] = createSignal(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
-  const [isFullscreen, setIsFullscreen] = createSignal(Boolean(document.fullscreenElement));
-  const objectUrls = new Map<number, string>();
-  const inflightFetches = new Map<number, AbortController>();
-  const progressStorageKey = createMemo(() => `chimera:reader-progress:${props.token}`);
-  const progressPercent = createMemo(() => {
-    const view = data();
-    if (!view || view.volume.pageCount === 0) {
-      return 0;
-    }
-
-    return Math.round((pageIndex() / view.volume.pageCount) * 100);
-  });
+  const { data, error, loading } = useJsonResource(props.token, fetchVolumeView);
+  const [pageIndex, setPageIndex] = useState(1);
+  const [pageImageUrls, setPageImageUrls] = useState<Record<number, string>>({});
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [hasRestoredProgress, setHasRestoredProgress] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
+  const objectUrlsRef = useRef(new Map<number, string>());
+  const inflightFetchesRef = useRef(new Map<number, AbortController>());
+  const progressStorageKey = `chimera:reader-progress:${props.token}`;
+  const progressPercent =
+    data && data.volume.pageCount > 0 ? Math.round((pageIndex / data.volume.pageCount) * 100) : 0;
 
   function clampPage(page: number, pageCount: number) {
     return Math.min(Math.max(page, 1), pageCount || 1);
   }
 
   function changePage(nextPage: number) {
-    const view = data();
-    if (!view) {
+    if (!data) {
       return;
     }
 
-    setPageIndex(clampPage(nextPage, view.volume.pageCount));
+    setPageIndex(clampPage(nextPage, data.volume.pageCount));
   }
 
   function stepPage(delta: number) {
-    changePage(pageIndex() + delta);
+    changePage(pageIndex + delta);
   }
 
   async function toggleFullscreen() {
@@ -311,40 +325,132 @@ function ReaderPage(props: { token: string }) {
     await document.documentElement.requestFullscreen();
   }
 
-  createEffect(() => {
-    const current = data();
-    if (current && pageIndex() > current.volume.pageCount) {
-      setPageIndex(current.volume.pageCount || 1);
+  function storeObjectUrl(page: number, nextObjectUrl: string) {
+    const previousObjectUrl = objectUrlsRef.current.get(page);
+    if (previousObjectUrl && previousObjectUrl !== nextObjectUrl) {
+      URL.revokeObjectURL(previousObjectUrl);
     }
-  });
 
-  createEffect(() => {
-    const view = data();
-    if (!view || hasRestoredProgress()) {
+    objectUrlsRef.current.set(page, nextObjectUrl);
+    setPageImageUrls((current) => ({
+      ...current,
+      [page]: nextObjectUrl,
+    }));
+  }
+
+  function removePageImage(page: number) {
+    const objectUrl = objectUrlsRef.current.get(page);
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      objectUrlsRef.current.delete(page);
+    }
+
+    inflightFetchesRef.current.get(page)?.abort();
+    inflightFetchesRef.current.delete(page);
+
+    setPageImageUrls((current) => {
+      if (!(page in current)) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[page];
+      return next;
+    });
+  }
+
+  async function ensurePageImageLoaded(page: number, prefetch = false) {
+    if (!data || page < 1 || page > data.volume.pageCount) {
       return;
     }
 
-    const storedPage = Number.parseInt(window.localStorage.getItem(progressStorageKey()) ?? "", 10);
+    if (objectUrlsRef.current.has(page) || inflightFetchesRef.current.has(page)) {
+      return;
+    }
+
+    const controller = new AbortController();
+    inflightFetchesRef.current.set(page, controller);
+
+    try {
+      const prefetchQuery = prefetch ? "?prefetch=1" : "";
+      const response = await fetch(`/api/volume-view/${props.token}/page/${page}/image${prefetchQuery}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+      }
+
+      const imageBlob = await response.blob();
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      storeObjectUrl(page, URL.createObjectURL(imageBlob));
+
+      if (page === pageIndex) {
+        setImageError(null);
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      if (page === pageIndex) {
+        setImageError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      inflightFetchesRef.current.delete(page);
+    }
+  }
+
+  useEffect(() => {
+    setPageIndex(1);
+    setPageImageUrls({});
+    setImageError(null);
+    setHasRestoredProgress(false);
+    setSidebarCollapsed(false);
+
+    for (const controller of inflightFetchesRef.current.values()) {
+      controller.abort();
+    }
+    inflightFetchesRef.current.clear();
+
+    for (const objectUrl of objectUrlsRef.current.values()) {
+      URL.revokeObjectURL(objectUrl);
+    }
+    objectUrlsRef.current.clear();
+  }, [props.token]);
+
+  useEffect(() => {
+    if (data && pageIndex > data.volume.pageCount) {
+      setPageIndex(data.volume.pageCount || 1);
+    }
+  }, [data, pageIndex]);
+
+  useEffect(() => {
+    if (!data || hasRestoredProgress) {
+      return;
+    }
+
+    const storedPage = Number.parseInt(window.localStorage.getItem(progressStorageKey) ?? "", 10);
     if (Number.isFinite(storedPage)) {
-      setPageIndex(clampPage(storedPage, view.volume.pageCount));
+      setPageIndex(clampPage(storedPage, data.volume.pageCount));
     }
 
     setHasRestoredProgress(true);
-  });
+  }, [data, hasRestoredProgress, progressStorageKey]);
 
-  createEffect(() => {
-    const view = data();
-    if (!view || !hasRestoredProgress()) {
+  useEffect(() => {
+    if (!data || !hasRestoredProgress) {
       return;
     }
 
-    window.localStorage.setItem(progressStorageKey(), String(pageIndex()));
-  });
+    window.localStorage.setItem(progressStorageKey, String(pageIndex));
+  }, [data, hasRestoredProgress, pageIndex, progressStorageKey]);
 
-  createEffect(() => {
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const current = data();
-      if (!current) {
+      if (!data) {
         return;
       }
 
@@ -358,12 +464,12 @@ function ReaderPage(props: { token: string }) {
 
       if (event.key === "ArrowRight" || event.key === "d" || event.key === "D" || event.key === " ") {
         event.preventDefault();
-        changePage(pageIndex() + 1);
+        setPageIndex((current) => clampPage(current + 1, data.volume.pageCount));
       }
 
       if (event.key === "ArrowLeft" || event.key === "a" || event.key === "A") {
         event.preventDefault();
-        changePage(pageIndex() - 1);
+        setPageIndex((current) => clampPage(current - 1, data.volume.pageCount));
       }
 
       if (event.key === "f" || event.key === "F") {
@@ -378,270 +484,214 @@ function ReaderPage(props: { token: string }) {
     };
 
     window.addEventListener("keydown", onKeyDown);
-    onCleanup(() => window.removeEventListener("keydown", onKeyDown));
-  });
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [data]);
 
-  createEffect(() => {
+  useEffect(() => {
     const onFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement));
     };
 
     document.addEventListener("fullscreenchange", onFullscreenChange);
-    onCleanup(() => document.removeEventListener("fullscreenchange", onFullscreenChange));
-  });
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
-  function pageImageEndpoint(page: number, prefetch = false) {
-    const prefetchQuery = prefetch ? "?prefetch=1" : "";
-    return `/api/volume-view/${props.token}/page/${page}/image${prefetchQuery}`;
-  }
-
-  function storeObjectUrl(page: number, nextObjectUrl: string) {
-    const previousObjectUrl = objectUrls.get(page);
-    if (previousObjectUrl && previousObjectUrl !== nextObjectUrl) {
-      URL.revokeObjectURL(previousObjectUrl);
-    }
-
-    objectUrls.set(page, nextObjectUrl);
-    setPageImageUrls((current) => ({
-      ...current,
-      [page]: nextObjectUrl,
-    }));
-  }
-
-  function removePageImage(page: number) {
-    const objectUrl = objectUrls.get(page);
-    if (objectUrl) {
-      URL.revokeObjectURL(objectUrl);
-      objectUrls.delete(page);
-    }
-
-    inflightFetches.get(page)?.abort();
-    inflightFetches.delete(page);
-
-    setPageImageUrls((current) => {
-      if (!(page in current)) {
-        return current;
-      }
-
-      const next = { ...current };
-      delete next[page];
-      return next;
-    });
-  }
-
-  async function ensurePageImageLoaded(page: number, prefetch = false) {
-    const view = data();
-    if (!view || page < 1 || page > view.volume.pageCount) {
+  useEffect(() => {
+    if (!data) {
       return;
     }
 
-    if (objectUrls.has(page) || inflightFetches.has(page)) {
-      return;
-    }
-
-    const controller = new AbortController();
-    inflightFetches.set(page, controller);
-
-    try {
-      const response = await fetch(pageImageEndpoint(page, prefetch), { signal: controller.signal });
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText}`);
-      }
-
-      const imageBlob = await response.blob();
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      storeObjectUrl(page, URL.createObjectURL(imageBlob));
-
-      if (page === pageIndex()) {
-        setImageError(null);
-      }
-    } catch (error) {
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      if (page === pageIndex()) {
-        setImageError(String(error));
-      }
-    } finally {
-      inflightFetches.delete(page);
-    }
-  }
-
-  createEffect(() => {
-    const view = data();
-    const currentPage = pageIndex();
-    if (!view) {
-      return;
-    }
-
-    const nextPage = currentPage < view.volume.pageCount ? currentPage + 1 : null;
-    const keepPages = new Set<number>([currentPage]);
+    const nextPage = pageIndex < data.volume.pageCount ? pageIndex + 1 : null;
+    const keepPages = new Set<number>([pageIndex]);
     if (nextPage !== null) {
       keepPages.add(nextPage);
     }
 
-    for (const page of [...objectUrls.keys()]) {
+    for (const page of [...objectUrlsRef.current.keys()]) {
       if (!keepPages.has(page)) {
         removePageImage(page);
       }
     }
 
-    for (const [page, controller] of inflightFetches.entries()) {
+    for (const [page, controller] of inflightFetchesRef.current.entries()) {
       if (!keepPages.has(page)) {
         controller.abort();
-        inflightFetches.delete(page);
+        inflightFetchesRef.current.delete(page);
       }
     }
 
-    void ensurePageImageLoaded(currentPage);
+    void ensurePageImageLoaded(pageIndex);
 
-    const currentPageReady = Boolean(pageImageUrls()[currentPage]);
-    if (currentPageReady && nextPage !== null) {
+    if (pageImageUrls[pageIndex] && nextPage !== null) {
       void ensurePageImageLoaded(nextPage, true);
     }
-  });
+  }, [data, pageIndex, pageImageUrls, props.token]);
 
-  onCleanup(() => {
-    for (const controller of inflightFetches.values()) {
-      controller.abort();
-    }
+  useEffect(() => {
+    return () => {
+      for (const controller of inflightFetchesRef.current.values()) {
+        controller.abort();
+      }
 
-    for (const objectUrl of objectUrls.values()) {
-      URL.revokeObjectURL(objectUrl);
-    }
-  });
+      for (const objectUrl of objectUrlsRef.current.values()) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, []);
 
   return (
-    <section class={`page reader-page${sidebarCollapsed() ? " reader-page--collapsed" : ""}`}>
-      <Show when={!data.loading} fallback={<p>Loading reader...</p>}>
-        <Show when={data()} keyed>
-          {(view) => (
-            <>
-              <div class="reader-layout">
-                <aside class={`reader-sidebar${sidebarCollapsed() ? " reader-sidebar--collapsed" : ""}`}>
-                  <div class="reader-sidebar-header">
-                    <Show
-                      when={!sidebarCollapsed()}
-                      fallback={
-                        <button class="reader-sidebar-toggle reader-sidebar-toggle--collapsed" onClick={() => setSidebarCollapsed(false)}>
-                          Open panel
-                        </button>
-                      }
-                    >
-                      <div class="reader-sidebar-brand">
-                        <div>
-                          <p class="reader-sidebar-eyebrow">Reader</p>
-                          <p class="reader-sidebar-title">Chimera</p>
-                        </div>
-                        <button class="reader-sidebar-toggle" onClick={() => setSidebarCollapsed(true)}>
-                          Collapse
-                        </button>
-                      </div>
-                    </Show>
+    <section className={`page reader-page${sidebarCollapsed ? " reader-page--collapsed" : ""}`}>
+      {loading ? <p>Loading reader...</p> : null}
+      {!loading && error ? <p>Failed to load reader: {error}</p> : null}
+      {!loading && !error && data ? (
+        <div className="reader-layout">
+          <aside className={`reader-sidebar${sidebarCollapsed ? " reader-sidebar--collapsed" : ""}`}>
+            <div className="reader-sidebar-header">
+              {!sidebarCollapsed ? (
+                <div className="reader-sidebar-brand">
+                  <div>
+                    <p className="reader-sidebar-eyebrow">Reader</p>
+                    <p className="reader-sidebar-title">Chimera</p>
                   </div>
-                  <Show when={!sidebarCollapsed()}>
-                    <div class="reader-sidebar-content">
-                      <div class="reader-sidebar-section">
-                        <a class="reader-sidebar-link" href={`/volume-view/${view.token}`}>Back to volume</a>
-                      </div>
-                      <div class="reader-sidebar-section">
-                        <p class="reader-series">{view.series.title}</p>
-                        <h1 class="reader-volume-title">{view.volume.title}</h1>
-                        <p class="reader-host-meta">Hosted by {view.host.username}</p>
-                      </div>
-                      <div class="reader-sidebar-section">
-                        <div class="reader-progress-panel">
-                          <label class="reader-page-jump">
-                            <span>Page</span>
-                            <input
-                              type="number"
-                              min="1"
-                              max={view.volume.pageCount}
-                              value={pageIndex()}
-                              onInput={(event) => {
-                                const nextPage = Number.parseInt(event.currentTarget.value, 10);
-                                if (Number.isFinite(nextPage)) {
-                                  changePage(nextPage);
-                                }
-                              }}
-                            />
-                          </label>
-                          <p class="reader-progress-fraction">{pageIndex()} / {view.volume.pageCount}</p>
-                          <div class="reader-progress-track" aria-hidden="true">
-                            <div class="reader-progress-fill" style={{ width: `${progressPercent()}%` }} />
-                          </div>
-                          <p class="reader-progress-caption">{progressPercent()}% read</p>
-                        </div>
-                      </div>
-                      <div class="reader-sidebar-section">
-                        <div class="reader-controls">
-                          <button disabled={pageIndex() <= 1} onClick={() => stepPage(-1)}>Previous</button>
-                          <button disabled={pageIndex() >= view.volume.pageCount} onClick={() => stepPage(1)}>Next</button>
-                        </div>
-                      </div>
-                      <div class="reader-sidebar-section">
-                        <div class="reader-actions reader-actions--stacked">
-                          <button onClick={() => void toggleFullscreen()}>
-                            {isFullscreen() ? "Exit fullscreen" : "Fullscreen"}
-                          </button>
-                        </div>
-                        <p class="muted reader-shortcuts">Shortcuts: A/Left previous, D/Right/Space next, F fullscreen, H toggle panel.</p>
-                      </div>
-                    </div>
-                  </Show>
-                </aside>
-                <div class="reader-main">
-              <Show
-                when={!imageError()}
-                fallback={
-                  <div class="reader-status-card">
-                    <p>Failed to load page image: {imageError()}</p>
-                    <button onClick={() => void ensurePageImageLoaded(pageIndex())}>Retry page</button>
-                  </div>
-                }
-              >
-                <Show
-                  when={pageImageUrls()[pageIndex()]}
-                  fallback={<div class="reader-status-card"><p>Loading page image...</p></div>}
+                  <button className="reader-sidebar-toggle" onClick={() => setSidebarCollapsed(true)}>
+                    Collapse
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="reader-sidebar-toggle reader-sidebar-toggle--collapsed"
+                  onClick={() => setSidebarCollapsed(false)}
                 >
-                  {(imageUrl) => (
-                    <div class="reader-stage">
-                      <button
-                        class="reader-hit-zone reader-hit-zone--left"
-                        aria-label="Previous page"
-                        disabled={pageIndex() <= 1}
-                        onClick={() => stepPage(-1)}
+                  Open panel
+                </button>
+              )}
+            </div>
+            {!sidebarCollapsed ? (
+              <div className="reader-sidebar-content">
+                <div className="reader-sidebar-section">
+                  <a className="reader-sidebar-link" href={`/volume-view/${data.token}`}>Back to volume</a>
+                </div>
+                <div className="reader-sidebar-section">
+                  <p className="reader-series">{data.series.title}</p>
+                  <h1 className="reader-volume-title">{data.volume.title}</h1>
+                  <p className="reader-host-meta">Hosted by {data.host.username}</p>
+                </div>
+                <div className="reader-sidebar-section">
+                  <div className="reader-progress-panel">
+                    <label className="reader-page-jump">
+                      <span>Page</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max={data.volume.pageCount}
+                        value={pageIndex}
+                        onChange={(event) => {
+                          const nextPage = Number.parseInt(event.currentTarget.value, 10);
+                          if (Number.isFinite(nextPage)) {
+                            changePage(nextPage);
+                          }
+                        }}
                       />
-                      <img class="reader-image" src={imageUrl()} alt={`${view.volume.title} page ${pageIndex()}`} />
-                      <button
-                        class="reader-hit-zone reader-hit-zone--right"
-                        aria-label="Next page"
-                        disabled={pageIndex() >= view.volume.pageCount}
-                        onClick={() => stepPage(1)}
-                      />
+                    </label>
+                    <p className="reader-progress-fraction">{pageIndex} / {data.volume.pageCount}</p>
+                    <div className="reader-progress-track" aria-hidden="true">
+                      <div className="reader-progress-fill" style={{ width: `${progressPercent}%` }} />
                     </div>
-                  )}
-                </Show>
-              </Show>
+                    <p className="reader-progress-caption">{progressPercent}% read</p>
+                  </div>
+                </div>
+                <div className="reader-sidebar-section">
+                  <div className="reader-controls">
+                    <button disabled={pageIndex <= 1} onClick={() => stepPage(-1)}>Previous</button>
+                    <button disabled={pageIndex >= data.volume.pageCount} onClick={() => stepPage(1)}>Next</button>
+                  </div>
+                </div>
+                <div className="reader-sidebar-section">
+                  <div className="reader-actions reader-actions--stacked">
+                    <button onClick={() => void toggleFullscreen()}>
+                      {isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                    </button>
+                  </div>
+                  <p className="muted reader-shortcuts">
+                    Shortcuts: A/Left previous, D/Right/Space next, F fullscreen, H toggle panel.
+                  </p>
                 </div>
               </div>
-            </>
-          )}
-        </Show>
-      </Show>
+            ) : null}
+          </aside>
+          <div className="reader-main">
+            {imageError ? (
+              <div className="reader-status-card">
+                <p>Failed to load page image: {imageError}</p>
+                <button onClick={() => void ensurePageImageLoaded(pageIndex)}>Retry page</button>
+              </div>
+            ) : pageImageUrls[pageIndex] ? (
+              <div className="reader-stage">
+                <button
+                  className="reader-hit-zone reader-hit-zone--left"
+                  aria-label="Previous page"
+                  disabled={pageIndex <= 1}
+                  onClick={() => stepPage(-1)}
+                />
+                <img
+                  className="reader-image"
+                  src={pageImageUrls[pageIndex]}
+                  alt={`${data.volume.title} page ${pageIndex}`}
+                />
+                <button
+                  className="reader-hit-zone reader-hit-zone--right"
+                  aria-label="Next page"
+                  disabled={pageIndex >= data.volume.pageCount}
+                  onClick={() => stepPage(1)}
+                />
+              </div>
+            ) : (
+              <div className="reader-status-card"><p>Loading page image...</p></div>
+            )}
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
 
 function NotFoundPage() {
   return (
-    <section class="page">
+    <section className="page">
       <h1>Not found</h1>
       <p><a href="/">Go home</a></p>
     </section>
+  );
+}
+
+export default function App() {
+  const [path, setPath] = useState(() => window.location.pathname);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setPath(window.location.pathname);
+    };
+
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  return (
+    <main className={`app-shell${path.startsWith("/read/") ? " app-shell--reader" : ""}`}>
+      {path === "/" ? <HomePage /> : null}
+      {path.startsWith("/series/") ? (
+        <SeriesPage seriesId={decodeURIComponent(path.replace("/series/", ""))} />
+      ) : null}
+      {path.startsWith("/read/") ? (
+        <ReaderPage token={decodeURIComponent(path.replace("/read/", ""))} />
+      ) : null}
+      {path.startsWith("/volume-view/") ? (
+        <VolumeViewPage token={decodeURIComponent(path.replace("/volume-view/", ""))} />
+      ) : null}
+      {path !== "/" &&
+      !path.startsWith("/series/") &&
+      !path.startsWith("/read/") &&
+      !path.startsWith("/volume-view/") ? <NotFoundPage /> : null}
+    </main>
   );
 }
