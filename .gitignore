@@ -8,3 +8,9 @@ frontend/dist/
 hoster/__pycache__/
 hoster/.venv/
 cloud
+
+# Local Node/npm artifacts (repo root)
+/.npm-cache/
+/node_modules/
+/package.json
+/package-lock.json
